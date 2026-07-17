@@ -317,7 +317,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		paused = false;
 		renderQueue(ctx);
 		try {
-			pi.sendUserMessage(userContent(next));
+			pi.sendUserMessage(userContent(next), { deliverAs: lane });
 			return true;
 		} catch (error) {
 			queue.prepend(next);
@@ -335,7 +335,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		if (!next) return false;
 		renderQueue(ctx);
 		try {
-			pi.sendUserMessage(userContent(next), ctx.isIdle() ? undefined : { deliverAs: "steer" });
+			pi.sendUserMessage(userContent(next), { deliverAs: "steer" });
 			return true;
 		} catch (error) {
 			queue.prepend(next);

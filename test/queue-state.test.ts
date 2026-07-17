@@ -498,3 +498,31 @@ test("recomposes after another extension installs editor chrome on a later tick"
 	harness.editor.handleInput("alt-up");
 	assert.equal(harness.editor.getText(), "original");
 });
+
+test("preserves the queued lane when dispatching from an idle snapshot", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	await enqueue(harness, "followUp", "deliver after the run");
+	harness.setIdle(true);
+
+	await harness.emit("agent_settled");
+
+	assert.deepEqual(harness.sent[0], {
+		content: "deliver after the run",
+		options: { deliverAs: "followUp" },
+	});
+});
+
+test("promotes a follow-up with steer intent even when isIdle is stale", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	await enqueue(harness, "followUp", "send this now");
+	harness.setIdle(true);
+
+	harness.editor.handleInput("enter");
+
+	assert.deepEqual(harness.sent[0], {
+		content: "send this now",
+		options: { deliverAs: "steer" },
+	});
+});
