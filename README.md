@@ -102,6 +102,8 @@ Aborting a run pauses both visible lanes. This prevents a follow-up from startin
 
 Press `Enter` on the empty composer to resume. A failed handoff returns the affected batch to the front of its lane.
 
+While Pi compacts (`/compact` or auto-compaction), submissions still land in the queue and stay editable there: `Enter` queues steering, `Option+Enter` queues a follow-up. Dispatch holds during the window and resumes when compaction ends; cancelling compaction with `Escape` unblocks immediately.
+
 Queue state, pause state and edit drafts are session-local. They never enter the Pi transcript.
 
 ## Proof limitation

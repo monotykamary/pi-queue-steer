@@ -9,6 +9,7 @@ import {
 	type ThemeColor,
 } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth, type Component, type EditorComponent } from "@earendil-works/pi-tui";
+import { CompactionWindow } from "./compaction-window.ts";
 import { extractInlineEditorLines } from "./editor-render.ts";
 import {
 	DeliveryQueue,
@@ -25,6 +26,8 @@ const QUEUE_STEER_FEATURE = "queue-steer";
 const NEXT_ROW_KEY = "alt+down";
 const RELOAD_STASH_KEY = "@tmustier/pi-queue-steer.reload-stash";
 const SUBMIT_GUARD = Symbol.for("@tmustier/pi-queue-steer.submit-guard");
+/** Backstop lifespan for a compaction capture window (see CompactionWindow). */
+const COMPACTION_WINDOW_MAX_MS = 5 * 60 * 1000;
 
 /** Rows surviving a queued /reload, parked on globalThis across the runtime swap. */
 interface ReloadStashRow {
@@ -243,6 +246,12 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 	// True while a queued /compact (or a just-dispatched /reload) is executing;
 	// suspends all lane dispatch until the command completes.
 	let commandRunning = false;
+	// True while Pi is compacting (manual /compact, threshold, or overflow).
+	// Pi core queues submissions privately then and never emits the extension
+	// input event, so the editor wrapper captures Enter/Alt+Enter itself and
+	// dispatch holds for the window's duration.
+	const compactionWindow = new CompactionWindow(COMPACTION_WINDOW_MAX_MS);
+	let compactionAbortSignal: AbortSignal | undefined;
 	// Pi's own editor submit handler, captured by the submit guard. Replaying text
 	// through it is the only public route to the built-in /reload.
 	let tuiSubmit: ((text: string) => void) | undefined;
@@ -322,11 +331,32 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		);
 	};
 
+	// Escape-cancelling compaction emits no session_compact event; close the
+	// window from the before-event abort signal instead. Submissions typed
+	// between the signal and Pi unwinding pass through and are still queued,
+	// by Pi natively rather than here.
+	const handleCompactionAbort = (): void => {
+		compactionAbortSignal?.removeEventListener("abort", handleCompactionAbort);
+		compactionAbortSignal = undefined;
+		if (!compactionWindow.end()) return;
+		const current = activeContext;
+		if (!current) return;
+		renderQueue(current);
+		if (!paused && !editSession && queue.length > 0 && current.isIdle()) dispatchFromIdle(current);
+	};
+
+	/** Close the capture window, detaching the abort-signal listener. */
+	const closeCompactionWindow = (): boolean => {
+		compactionAbortSignal?.removeEventListener("abort", handleCompactionAbort);
+		compactionAbortSignal = undefined;
+		return compactionWindow.end();
+	};
+
 	// Message rows only; command rows never dispatch at active-run boundaries.
 	// A command row at the lane head holds everything behind it (FIFO) until the
 	// agent settles and dispatchFromIdle executes it.
 	const takeLaneBatch = (lane: QueueLane): QueuedMessage<ImageContent>[] => {
-		if (paused || commandRunning || queue.laneLength(lane) === 0 || laneIsHeld(lane)) return [];
+		if (paused || commandRunning || compactionWindow.isActive() || queue.laneLength(lane) === 0 || laneIsHeld(lane)) return [];
 		const isMessage = (item: QueuedMessage<ImageContent>) => parseQueuedCommand(item.text) === undefined;
 		if (queueModes()[lane] === "all") return queue.shiftWhile(lane, isMessage);
 		const head = queue.peek(lane);
@@ -428,7 +458,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 
 	const dispatchFromIdle = (ctx: ExtensionContext): boolean => {
 		activeContext = ctx;
-		if (commandRunning) {
+		if (commandRunning || compactionWindow.isActive()) {
 			renderQueue(ctx);
 			return false;
 		}
@@ -462,6 +492,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 	};
 
 	const sendFollowUpNow = (ctx: ExtensionContext): boolean => {
+		if (compactionWindow.isActive()) return false;
 		const head = queue.peek("followUp");
 		if (!head) return false;
 		const headCommand = parseQueuedCommand(head.text);
@@ -618,6 +649,28 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 					}
 				}
 
+				if (compactionWindow.isActive()) {
+					// Pi core queues submissions privately mid-compaction and never
+					// emits the extension input event; capture them here so rows stay
+					// editable in the queue widget. Slash commands and `!` bash pass
+					// through: Pi core handles those ahead of its compaction branch.
+					// Paste images pending in the editor are not readable through the
+					// public editor surface, matching Pi core's own capture fidelity.
+					const followUp = keybindings.matches(data, "app.message.followUp");
+					const submit = !followUp
+						&& keybindings.matches(data, "tui.input.submit")
+						&& !isShowingAutocomplete();
+					const captureText = editor.getText().trim();
+					if ((followUp || submit) && captureText !== "" && !captureText.startsWith("/") && !captureText.startsWith("!")) {
+						queue.enqueue(followUp ? "followUp" : "steer", captureText, []);
+						paused = false;
+						editor.addToHistory?.(captureText);
+						ctx.ui.setEditorText("");
+						renderQueue(ctx);
+						return;
+					}
+				}
+
 				if (queue.length > 0 && keybindings.matches(data, "app.message.dequeue")) {
 					selectQueueItem(ctx, "previous");
 					return;
@@ -702,6 +755,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", (event, ctx) => {
 		activeContext = ctx;
+		closeCompactionWindow();
 		settingsManager = SettingsManager.create(ctx.cwd, undefined, { projectTrusted: ctx.isProjectTrusted() });
 		ctx.ui.setWidget(WIDGET_ID, undefined);
 		restoreReloadStash(event.reason, ctx);
@@ -719,6 +773,9 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("input", (event, ctx) => {
+		// Pi only emits input events when its compaction queueing is off, so
+		// receiving one proves any open capture window is stale.
+		closeCompactionWindow();
 		if (event.source !== "interactive") return { action: "continue" };
 		activeContext = ctx;
 
@@ -766,6 +823,9 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 	// continuation semantics without relinquishing later editable rows early.
 	pi.on("agent_end", async (_event, ctx) => {
 		activeContext = ctx;
+		// Agent boundaries arrive only outside a compaction window; this drops
+		// any window left open by a failed auto-compaction.
+		closeCompactionWindow();
 		if (paused) return;
 		if (queue.laneLength("steer") > 0) {
 			await dispatchLaneAtBoundary(ctx, "steer");
@@ -780,8 +840,33 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		if (!paused && !editSession && queue.length > 0 && ctx.isIdle()) dispatchFromIdle(ctx);
 	});
 
+	// Pi core queues submissions privately while compacting (interactive mode
+	// checks session.isCompacting before anything reaches the extension input
+	// event) and shows its native queue UI. Track the window so the editor
+	// wrapper captures Enter/Alt+Enter itself and dispatch holds until Pi
+	// settles again.
+	pi.on("session_before_compact", (event, ctx) => {
+		activeContext = ctx;
+		if (event.signal.aborted) return;
+		compactionAbortSignal?.removeEventListener("abort", handleCompactionAbort);
+		compactionAbortSignal = event.signal;
+		compactionWindow.begin();
+		event.signal.addEventListener("abort", handleCompactionAbort, { once: true });
+		renderQueue(ctx);
+	});
+
+	pi.on("session_compact", (_event, ctx) => {
+		activeContext = ctx;
+		if (!closeCompactionWindow()) return;
+		renderQueue(ctx);
+		// A manual compaction that aborted a run leaves the queue paused via
+		// turn_end; otherwise rows captured mid-compaction dispatch once idle.
+		if (!paused && !editSession && queue.length > 0 && ctx.isIdle()) dispatchFromIdle(ctx);
+	});
+
 	pi.on("session_shutdown", () => {
 		if (editorInstallTimer) clearTimeout(editorInstallTimer);
+		closeCompactionWindow();
 		if (activeContext?.hasUI) activeContext.ui.setWidget(WIDGET_ID, undefined);
 		activeContext = undefined;
 		renderInlineEditor = undefined;

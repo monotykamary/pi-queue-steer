@@ -21,6 +21,7 @@
   "homepage": "https://github.com/tmustier/pi-queue-steer",
   "files": [
     "index.ts",
+    "compaction-window.ts",
     "editor-render.ts",
     "queue-state.ts",
     "README.md",

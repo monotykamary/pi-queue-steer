@@ -666,3 +666,119 @@ test("promotes a follow-up with steer intent even when isIdle is stale", async (
 		options: { deliverAs: "steer" },
 	});
 });
+
+test("captures Enter into the steering lane during compaction", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	const controller = new AbortController();
+	await harness.emit("session_before_compact", { signal: controller.signal });
+
+	harness.editor.setText("hold this for after the compact");
+	harness.editor.handleInput("enter");
+
+	assert.equal(harness.editor.getText(), "");
+	assert.equal(harness.sent.length, 0);
+	const rendered = renderWidget(harness);
+	assert.match(rendered, /steering queue \(1\)/);
+	assert.match(rendered, /hold this for after the compact/);
+});
+
+test("captures Alt+Enter into the follow-up lane during compaction", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	await harness.emit("session_before_compact", { signal: new AbortController().signal });
+
+	harness.editor.setText("later idea");
+	harness.editor.handleInput("alt-enter");
+
+	assert.equal(harness.editor.getText(), "");
+	assert.equal(harness.sent.length, 0);
+	const rendered = renderWidget(harness);
+	assert.match(rendered, /follow-ups \(1\)/);
+	assert.match(rendered, /later idea/);
+});
+
+test("slash commands and bash pass through during compaction", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	await harness.emit("session_before_compact", { signal: new AbortController().signal });
+
+	harness.editor.setText("/model");
+	harness.editor.handleInput("enter");
+	harness.editor.setText("!git status");
+	harness.editor.handleInput("enter");
+
+	assert.equal(harness.editor.getText(), "!git status");
+	assert.equal(harness.sent.length, 0);
+	assert.equal(harness.widget, undefined);
+});
+
+test("an already-aborted compaction signal arms no capture window", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	const controller = new AbortController();
+	controller.abort();
+	await harness.emit("session_before_compact", { signal: controller.signal });
+
+	harness.editor.setText("still normal");
+	harness.editor.handleInput("enter");
+
+	assert.equal(harness.editor.getText(), "still normal");
+	assert.equal(harness.widget, undefined);
+});
+
+test("dispatch and turn boundaries hold during compaction and resume after it", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	harness.setIdle(true);
+	await enqueue(harness, "steer", "older steer");
+	const controller = new AbortController();
+	await harness.emit("session_before_compact", { signal: controller.signal });
+
+	harness.editor.setText("captured mid-compact");
+	harness.editor.handleInput("enter");
+	await harness.emit("turn_end", { message: { role: "assistant", stopReason: "toolUse" } });
+	await harness.emit("agent_settled");
+	assert.equal(harness.sent.length, 0);
+
+	await harness.emit("session_compact", { reason: "manual" });
+
+	assert.deepEqual(harness.sent, [
+		{ content: "older steer", options: { deliverAs: "steer" } },
+	]);
+	// The mid-compaction capture keeps FIFO behind the older steering row.
+	const rendered = renderWidget(harness);
+	assert.match(rendered, /captured mid-compact/);
+	assert.ok(rendered.indexOf("captured mid-compact") > rendered.indexOf("steering queue"));
+});
+
+test("compaction abort closes the window and resumes dispatch without session_compact", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	harness.setIdle(true);
+	await enqueue(harness, "steer", "send once compacting is cancelled");
+	const controller = new AbortController();
+	await harness.emit("session_before_compact", { signal: controller.signal });
+
+	controller.abort();
+
+	assert.deepEqual(harness.sent, [
+		{ content: "send once compacting is cancelled", options: { deliverAs: "steer" } },
+	]);
+});
+
+test("a live input event proves a stale compaction window ended", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	await harness.emit("session_before_compact", { signal: new AbortController().signal });
+	harness.editor.setText("queued while compacting");
+	harness.editor.handleInput("enter");
+	assert.match(renderWidget(harness), /queued while compacting/);
+
+	await harness.emit("input", { source: "interactive", text: "next prompt reached Pi normally" });
+
+	harness.editor.setText("typed after the failed compact");
+	harness.editor.handleInput("enter");
+	assert.equal(harness.editor.getText(), "typed after the failed compact");
+	assert.doesNotMatch(renderWidget(harness), /typed after the failed compact/);
+});
