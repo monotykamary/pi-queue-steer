@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Expand queued prompt templates and Agent Skills at delivery, with arguments, images, short aliases such as `/bro`, and full-batch restoration if expansion fails.
 - Make command rows compaction-aware: idle `/compact` uses Pi's public compaction API, `/reload` waits for direct or automatic compaction to settle, and ordinary messages stay in Pi's native compaction queue.
 
 - Add command rows: `/compact [instructions]` and `/reload` queue in FIFO position and execute only once the agent is idle, so rows behind them wait — e.g. a queued `continue` delivers after compaction completes.
