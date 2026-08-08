@@ -10,6 +10,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth, type Component, type EditorComponent } from "@earendil-works/pi-tui";
 import { extractInlineEditorLines } from "./editor-render.ts";
+import { expandQueuedInput } from "./queued-input.ts";
 import {
 	DeliveryQueue,
 	parseQueuedCommand,
@@ -252,6 +253,15 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		followUp: settingsManager?.getFollowUpMode() ?? "one-at-a-time",
 	});
 
+	const pauseAfterPreparationFailure = (ctx: ExtensionContext, lane: QueueLane, error: unknown): void => {
+		paused = true;
+		renderQueue(ctx);
+		ctx.ui.notify(
+			`Could not prepare queued ${laneLabel(lane)}; queue paused: ${error instanceof Error ? error.message : String(error)}`,
+			"error",
+		);
+	};
+
 	const laneIsHeld = (lane: QueueLane): boolean => {
 		if (!editSession) return false;
 		const mode = queueModes()[lane];
@@ -341,10 +351,19 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		items: QueuedMessage<ImageContent>[],
 	): Promise<boolean> => {
 		if (items.length === 0) return false;
+		let prepared: QueuedMessage<ImageContent>[];
+		try {
+			const commands = pi.getCommands();
+			prepared = items.map((item) => ({ ...item, text: expandQueuedInput(item.text, commands) }));
+		} catch (error) {
+			queue.prependMany(items);
+			pauseAfterPreparationFailure(ctx, lane, error);
+			return false;
+		}
 		const pendingBefore = ctx.hasPendingMessages();
 		renderQueue(ctx);
 		try {
-			for (const item of items) {
+			for (const item of prepared) {
 				pi.sendUserMessage(userContent(item), { deliverAs: lane });
 			}
 			// sendUserMessage is fire-and-forget. Keep the awaited boundary
@@ -426,6 +445,33 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		return true;
 	};
 
+	const sendHeadMessage = (ctx: ExtensionContext, lane: QueueLane, deliverAs?: QueueLane): boolean => {
+		const head = queue.peek(lane);
+		if (!head) return false;
+		let prepared: QueuedMessage<ImageContent>;
+		try {
+			prepared = { ...head, text: expandQueuedInput(head.text, pi.getCommands()) };
+		} catch (error) {
+			pauseAfterPreparationFailure(ctx, lane, error);
+			return false;
+		}
+		queue.shift(lane);
+		paused = false;
+		renderQueue(ctx);
+		try {
+			pi.sendUserMessage(userContent(prepared), deliverAs ? { deliverAs } : undefined);
+			return true;
+		} catch (error) {
+			queue.prepend(head);
+			renderQueue(ctx);
+			ctx.ui.notify(
+				`Could not send queued ${laneLabel(lane)}: ${error instanceof Error ? error.message : String(error)}`,
+				"error",
+			);
+			return false;
+		}
+	};
+
 	const dispatchFromIdle = (ctx: ExtensionContext): boolean => {
 		activeContext = ctx;
 		if (commandRunning) {
@@ -443,22 +489,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		}
 		const head = queue.peek(lane);
 		if (head && parseQueuedCommand(head.text)) return executeCommandRow(ctx, lane);
-		const next = queue.shift(lane);
-		if (!next) return false;
-		paused = false;
-		renderQueue(ctx);
-		try {
-			pi.sendUserMessage(userContent(next));
-			return true;
-		} catch (error) {
-			queue.prepend(next);
-			renderQueue(ctx);
-			ctx.ui.notify(
-				`Could not send queued ${laneLabel(lane)}: ${error instanceof Error ? error.message : String(error)}`,
-				"error",
-			);
-			return false;
-		}
+		return sendHeadMessage(ctx, lane);
 	};
 
 	const sendFollowUpNow = (ctx: ExtensionContext): boolean => {
@@ -472,21 +503,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 			}
 			return executeCommandRow(ctx, "followUp");
 		}
-		const next = queue.shift("followUp");
-		if (!next) return false;
-		renderQueue(ctx);
-		try {
-			pi.sendUserMessage(userContent(next), ctx.isIdle() ? undefined : { deliverAs: "steer" });
-			return true;
-		} catch (error) {
-			queue.prepend(next);
-			renderQueue(ctx);
-			ctx.ui.notify(
-				`Could not send queued follow-up: ${error instanceof Error ? error.message : String(error)}`,
-				"error",
-			);
-			return false;
-		}
+		return sendHeadMessage(ctx, "followUp", ctx.isIdle() ? undefined : "steer");
 	};
 
 	const finishEditing = (
