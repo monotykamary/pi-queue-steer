@@ -240,9 +240,9 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 	let renderingInline = false;
 	let paused = false;
 	let settingsManager: SettingsManager | undefined;
-	// True while a queued /compact (or a just-dispatched /reload) is executing;
-	// suspends all lane dispatch until the command completes.
-	let commandRunning = false;
+	let blockingActivity: "compact" | "auto-compact" | "reload" | undefined;
+	let compactionFinishTimer: ReturnType<typeof setTimeout> | undefined;
+	const isCompacting = (): boolean => blockingActivity === "compact" || blockingActivity === "auto-compact";
 	// Pi's own editor submit handler, captured by the submit guard. Replaying text
 	// through it is the only public route to the built-in /reload.
 	let tuiSubmit: ((text: string) => void) | undefined;
@@ -326,7 +326,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 	// A command row at the lane head holds everything behind it (FIFO) until the
 	// agent settles and dispatchFromIdle executes it.
 	const takeLaneBatch = (lane: QueueLane): QueuedMessage<ImageContent>[] => {
-		if (paused || commandRunning || queue.laneLength(lane) === 0 || laneIsHeld(lane)) return [];
+		if (paused || blockingActivity || queue.laneLength(lane) === 0 || laneIsHeld(lane)) return [];
 		const isMessage = (item: QueuedMessage<ImageContent>) => parseQueuedCommand(item.text) === undefined;
 		if (queueModes()[lane] === "all") return queue.shiftWhile(lane, isMessage);
 		const head = queue.peek(lane);
@@ -389,22 +389,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		paused = false;
 		renderQueue(ctx);
 		if (command.kind === "compact") {
-			commandRunning = true;
-			ctx.ui.notify(`Running queued /compact${command.instructions ? ` (${command.instructions})` : ""}`, "info");
-			const resume = () => {
-				commandRunning = false;
-				const current = activeContext ?? ctx;
-				renderQueue(current);
-				if (!paused && !editSession && queue.length > 0 && current.isIdle()) dispatchFromIdle(current);
-			};
-			ctx.compact({
-				customInstructions: command.instructions,
-				onComplete: resume,
-				onError: (error) => {
-					(activeContext ?? ctx).ui.notify(`Queued /compact failed: ${error.message}`, "error");
-					resume();
-				},
-			});
+			startCompaction(ctx, command.instructions);
 			return true;
 		}
 		const submit = tuiSubmit;
@@ -420,7 +405,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 			};
 			globalStore[RELOAD_STASH_KEY] = stash;
 		}
-		commandRunning = true;
+		blockingActivity = "reload";
 		// Defer so the extension runtime is never torn down from inside this handler.
 		setTimeout(() => submit("/reload"), 0);
 		return true;
@@ -428,7 +413,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 
 	const dispatchFromIdle = (ctx: ExtensionContext): boolean => {
 		activeContext = ctx;
-		if (commandRunning) {
+		if (blockingActivity) {
 			renderQueue(ctx);
 			return false;
 		}
@@ -461,12 +446,41 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		}
 	};
 
+	const deferCompactionFinish = (
+		ctx: ExtensionContext,
+		activity: "compact" | "auto-compact",
+	): void => {
+		compactionFinishTimer = setTimeout(() => {
+			compactionFinishTimer = undefined;
+			if (blockingActivity !== activity) return;
+			blockingActivity = undefined;
+			const current = activeContext ?? ctx;
+			renderQueue(current);
+			if (!paused && !editSession && queue.length > 0 && current.isIdle()) dispatchFromIdle(current);
+		}, 0);
+	};
+
+	const startCompaction = (ctx: ExtensionContext, instructions: string | undefined): void => {
+		blockingActivity = "compact";
+		ctx.compact({
+			customInstructions: instructions,
+			onComplete: () => deferCompactionFinish(ctx, "compact"),
+			onError: () => deferCompactionFinish(ctx, "compact"),
+		});
+	};
+
+	const deferCommand = (ctx: ExtensionContext, text: string): void => {
+		queue.enqueue("followUp", text);
+		paused = false;
+		renderQueue(ctx);
+	};
+
 	const sendFollowUpNow = (ctx: ExtensionContext): boolean => {
 		const head = queue.peek("followUp");
 		if (!head) return false;
 		const headCommand = parseQueuedCommand(head.text);
 		if (headCommand) {
-			if (commandRunning || !ctx.isIdle()) {
+			if (blockingActivity === "reload" || !ctx.isIdle()) {
 				ctx.ui.notify(`Queued /${headCommand.kind} runs when the agent is idle`, "info");
 				return false;
 			}
@@ -510,7 +524,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		renderQueue(ctx);
 
 		// A pinned head may have let the agent settle while it was edited.
-		if (ctx.isIdle() && !paused) dispatchFromIdle(ctx);
+		if (ctx.isIdle() && !paused && !blockingActivity) dispatchFromIdle(ctx);
 	};
 
 	const selectQueueItem = (ctx: ExtensionContext, direction: "previous" | "next"): void => {
@@ -618,6 +632,16 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 					}
 				}
 
+				if (keybindings.matches(data, "app.message.followUp") && !isShowingAutocomplete()) {
+					const text = (editor.getExpandedText?.() ?? editor.getText()).trim();
+					if (isCompacting() && parseQueuedCommand(text)) {
+						deferCommand(ctx, text);
+						editor.addToHistory?.(text);
+						editor.setText("");
+						return;
+					}
+				}
+
 				if (queue.length > 0 && keybindings.matches(data, "app.message.dequeue")) {
 					selectQueueItem(ctx, "previous");
 					return;
@@ -638,6 +662,10 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 					!editor.getText().trim() &&
 					keybindings.matches(data, "tui.input.submit")
 				) {
+					if (isCompacting()) {
+						ctx.ui.notify("Queued messages will run after compaction finishes", "info");
+						return;
+					}
 					if (paused) {
 						paused = false;
 						if (ctx.isIdle()) dispatchFromIdle(ctx);
@@ -658,13 +686,6 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		renderQueue(ctx);
 	};
 
-	/**
-	 * Wrap the semantic submit point (after autocomplete resolution) so a mid-run
-	 * Enter on /reload queues it instead of hitting Pi's built-in "wait until the
-	 * agent finishes" warning. Everything else, including mid-run /compact,
-	 * passes through to Pi's own dispatch unchanged. The wrap also captures Pi's
-	 * submit handler for the queued-/reload replay.
-	 */
 	const installSubmitGuard = (editor: EditorComponent, ctx: ExtensionContext): void => {
 		const guarded = editor as EditorComponent & { [SUBMIT_GUARD]?: boolean };
 		if (guarded[SUBMIT_GUARD]) return;
@@ -673,7 +694,19 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		if (innerSubmit) tuiSubmit = innerSubmit;
 		const wrappedSubmit = (text: string) => {
 			const command = parseQueuedCommand(text);
-			if (command?.kind === "reload" && !editSession && (commandRunning || !ctx.isIdle())) {
+			if (!editSession && command && isCompacting()) {
+				deferCommand(ctx, text);
+				editor.addToHistory?.(text);
+				editor.setText("");
+				return;
+			}
+			if (command?.kind === "compact" && !editSession && ctx.isIdle()) {
+				editor.addToHistory?.(text);
+				editor.setText("");
+				startCompaction(ctx, command.instructions);
+				return;
+			}
+			if (command?.kind === "reload" && !editSession && (blockingActivity === "reload" || !ctx.isIdle())) {
 				queue.enqueue("followUp", text, []);
 				paused = false;
 				renderQueue(ctx);
@@ -729,6 +762,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 			return { action: "handled" };
 		}
 
+		const command = parseQueuedCommand(event.text);
 		if (event.streamingBehavior === "steer" || event.streamingBehavior === "followUp") {
 			queue.enqueue(event.streamingBehavior, event.text, event.images);
 			paused = false;
@@ -736,24 +770,29 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 			return { action: "handled" };
 		}
 
-		// Idle command submissions (e.g. alt+enter bypasses Pi's built-in dispatch)
-		// would otherwise reach the LLM as text. Route them through the queue; when
-		// nothing is running they execute immediately.
-		if (event.streamingBehavior === undefined && parseQueuedCommand(event.text) && (ctx.isIdle() || commandRunning)) {
+		// Alt+Enter can bypass Pi's built-in command dispatch while idle.
+		if (event.streamingBehavior === undefined && command && ctx.isIdle()) {
 			queue.enqueue("followUp", event.text, event.images ?? []);
 			paused = false;
 			renderQueue(ctx);
-			if (!commandRunning && ctx.isIdle()) dispatchFromIdle(ctx);
+			dispatchFromIdle(ctx);
 			return { action: "handled" };
 		}
 
 		return { action: "continue" };
 	});
 
+	pi.on("session_before_compact", (event, ctx) => {
+		activeContext = ctx;
+		if (blockingActivity || event.reason === "manual") return;
+		blockingActivity = "auto-compact";
+		renderQueue(ctx);
+	});
+
 	pi.on("turn_end", async (event, ctx) => {
 		activeContext = ctx;
 		if (event.message.role === "assistant" && event.message.stopReason === "aborted") {
-			if (queue.length > 0) paused = true;
+			if (queue.length > 0 && blockingActivity !== "compact") paused = true;
 			renderQueue(ctx);
 			return;
 		}
@@ -776,20 +815,26 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 
 	pi.on("agent_settled", (_event, ctx) => {
 		activeContext = ctx;
+		if (blockingActivity === "auto-compact") {
+			deferCompactionFinish(ctx, "auto-compact");
+			return;
+		}
 		renderQueue(ctx);
-		if (!paused && !editSession && queue.length > 0 && ctx.isIdle()) dispatchFromIdle(ctx);
+		if (!paused && !editSession && queue.length > 0 && ctx.isIdle() && !blockingActivity) dispatchFromIdle(ctx);
 	});
 
 	pi.on("session_shutdown", () => {
 		if (editorInstallTimer) clearTimeout(editorInstallTimer);
+		if (compactionFinishTimer) clearTimeout(compactionFinishTimer);
 		if (activeContext?.hasUI) activeContext.ui.setWidget(WIDGET_ID, undefined);
 		activeContext = undefined;
 		renderInlineEditor = undefined;
 		editorInstallTimer = undefined;
+		compactionFinishTimer = undefined;
 		editSession = undefined;
 		settingsManager = undefined;
 		paused = false;
-		commandRunning = false;
+		blockingActivity = undefined;
 		tuiSubmit = undefined;
 		queue.clear();
 	});

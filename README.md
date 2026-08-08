@@ -76,7 +76,9 @@ Rows whose text is exactly `/compact`, `/compact <instructions>` or `/reload` ar
 - `Option+Enter` while the agent works queues the command in follow-up order
 - a command row executes only once the agent is idle; rows behind it wait — so `/compact` followed by `continue` compacts first and delivers `continue` after compaction completes
 - `/reload` runs Pi’s built-in reload; rows queued behind it are restored after the runtime swap
-- `Enter` on `/reload` while the agent works queues it too, replacing Pi’s built-in “wait until the agent finishes” warning; `Enter` on `/compact` keeps Pi’s built-in immediate behaviour
+- idle `/compact` uses Pi’s public compaction API so queued rows resume when compaction finishes
+- `/reload` submitted while the agent works or tracked compaction runs stays queued instead of showing Pi’s built-in wait warning
+- ordinary messages submitted during compaction remain in Pi’s native queue
 - `Option+Enter` on a command while the agent is idle executes it immediately instead of sending the text to the model
 - command rows show a `⚙` marker and pause, resume and edit like any other row; editing a row into or out of command form just works
 
@@ -126,7 +128,7 @@ pi -e ./index.ts
 
 The automated suite covers both lanes, queue modes, delivery boundaries, stable edits, rollback, removal marks, lane toggles, command-row parsing and batch cuts, abort recovery, image preservation, failed handoffs, editor-frame extraction and editor composition. Check TUI changes in a real interactive Pi session as well.
 
-Tested with Pi 0.80.9.
+Tested with Pi 0.80.9 and 0.84.1.
 
 ## Security
 

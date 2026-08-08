@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import type { CompactOptions } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import queueSteerExtension from "../index.ts";
 import { DeliveryQueue, QueueEditSession, type QueueLane } from "../queue-state.ts";
@@ -156,15 +157,26 @@ class MockEditor {
 	invalidate(): void {}
 }
 
+const DEFAULT_TEST_CWD = mkdtempSync(join(tmpdir(), "pi-queue-steer-default-"));
+mkdirSync(join(DEFAULT_TEST_CWD, ".pi"));
+writeFileSync(
+	join(DEFAULT_TEST_CWD, ".pi", "settings.json"),
+	JSON.stringify({ steeringMode: "one-at-a-time", followUpMode: "one-at-a-time" }),
+);
+test.after(() => rmSync(DEFAULT_TEST_CWD, { recursive: true, force: true }));
+
 function createHarness(options: { cwd?: string; projectTrusted?: boolean } = {}) {
 	type Handler = (event: any, context: any) => any;
 	const handlers = new Map<string, Handler[]>();
 	const sent: Array<{ content: unknown; options: any }> = [];
+	const submitted: string[] = [];
+	const compactCalls: CompactOptions[] = [];
 	const notifications: Array<{ message: string; level: string }> = [];
 	let idle = false;
 	let pending = false;
 	let aborted = false;
 	let activeEditor = new MockEditor();
+	activeEditor.onSubmit = (text) => submitted.push(text);
 	let currentFactory: any = () => activeEditor;
 	let widget: unknown;
 
@@ -198,13 +210,16 @@ function createHarness(options: { cwd?: string; projectTrusted?: boolean } = {})
 	const context = {
 		mode: "tui",
 		hasUI: true,
-		cwd: options.cwd ?? "/tmp",
+		cwd: options.cwd ?? DEFAULT_TEST_CWD,
 		ui,
 		isIdle: () => idle,
-		isProjectTrusted: () => options.projectTrusted ?? false,
+		isProjectTrusted: () => options.projectTrusted ?? true,
 		hasPendingMessages: () => pending,
 		abort() {
 			aborted = true;
+		},
+		compact(options: CompactOptions = {}) {
+			compactCalls.push(options);
 		},
 	};
 
@@ -233,6 +248,8 @@ function createHarness(options: { cwd?: string; projectTrusted?: boolean } = {})
 	return {
 		emit,
 		sent,
+		submitted,
+		compactCalls,
 		notifications,
 		get editor() {
 			return activeEditor;
@@ -271,6 +288,14 @@ function renderWidget(harness: ReturnType<typeof createHarness>, width = 76): st
 	const widgetFactory = harness.widget as (tui: unknown, theme: any) => { render(width: number): string[] };
 	const component = widgetFactory({}, { fg: (_color: string, text: string) => text });
 	return component.render(width).join("\n");
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+	for (let attempt = 0; attempt < 20; attempt += 1) {
+		if (predicate()) return;
+		await new Promise((resolve) => setTimeout(resolve, 0));
+	}
+	assert.fail("Timed out waiting for condition");
 }
 
 test("renders stacked lane boxes with steering above follow-ups", async () => {
@@ -637,4 +662,64 @@ test("recomposes after another extension installs editor chrome on a later tick"
 	await new Promise((resolve) => setTimeout(resolve, 5));
 	harness.editor.handleInput("alt-up");
 	assert.equal(harness.editor.getText(), "original");
+});
+
+test("keeps reload runnable when compact aborts a preflight prompt", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	harness.setIdle(true);
+	await harness.emit("input", { source: "interactive", text: "native prompt" });
+
+	harness.editor.onSubmit?.("/compact keep the prompt details");
+	assert.equal(harness.compactCalls[0]?.customInstructions, "keep the prompt details");
+	harness.editor.onSubmit?.("/reload");
+	assert.match(renderWidget(harness), /\/reload/);
+
+	await harness.emit("turn_end", { message: { role: "assistant", stopReason: "aborted" } });
+	harness.compactCalls[0]?.onError?.(new Error("summary failed"));
+	await waitFor(() => harness.submitted.length === 1);
+	assert.deepEqual(harness.submitted, ["/reload"]);
+});
+
+test("leaves ordinary compaction input native and waits for its run", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	harness.setIdle(true);
+	harness.editor.onSubmit?.("/compact");
+	assert.equal(harness.compactCalls.length, 1);
+
+	harness.editor.onSubmit?.("ordinary native message");
+	assert.deepEqual(harness.submitted, ["ordinary native message"]);
+
+	harness.editor.setText("/reload");
+	harness.editor.handleInput("alt-enter");
+	assert.match(renderWidget(harness), /\/reload/);
+
+	harness.setIdle(false);
+	harness.compactCalls[0]?.onComplete?.({
+		summary: "summary",
+		firstKeptEntryId: "entry-1",
+		tokensBefore: 100,
+		estimatedTokensAfter: 20,
+	});
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.deepEqual(harness.submitted, ["ordinary native message"]);
+
+	harness.setIdle(true);
+	await harness.emit("agent_settled");
+	await waitFor(() => harness.submitted.length === 2);
+	assert.deepEqual(harness.submitted, ["ordinary native message", "/reload"]);
+});
+
+test("holds reload through automatic compaction until the agent settles", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	harness.setIdle(true);
+	await harness.emit("session_before_compact", { reason: "overflow" });
+	harness.editor.onSubmit?.("/reload");
+	assert.equal(harness.submitted.length, 0);
+
+	await harness.emit("agent_settled");
+	await waitFor(() => harness.submitted.length === 1);
+	assert.deepEqual(harness.submitted, ["/reload"]);
 });
