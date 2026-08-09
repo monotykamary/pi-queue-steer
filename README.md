@@ -140,7 +140,7 @@ pi -e ./index.ts
 
 The automated suite covers delivery, editing, command rows, resource expansion, recovery, images, editor composition, repeated reloads, real retry ordering, real manual compaction success/failure and real automatic overflow compaction. The tmux harness exercises the same paths through Pi's real TUI, including actual runtime reloads and native post-compaction input.
 
-The full suite is verified against the pinned Pi 0.80.9 baseline and Pi 0.84.1. See [the validation record](docs/validation.md) for exact commands and evidence.
+The Pi package ranges are intentionally unpinned. The full suite and real-TUI harness are verified against the current resolved Pi release; see [the validation record](docs/validation.md) for exact commands and evidence.
 
 ## Security
 

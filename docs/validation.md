@@ -4,30 +4,28 @@ This document records the deterministic validation matrix for compaction-aware c
 
 ## Automated suite
 
-Run the pinned Pi 0.80.9 baseline:
+The Pi package ranges are intentionally unpinned. The lockfile records the versions used for a reproducible checkout, but the package manifest does not declare an artificial Pi compatibility target.
+
+Run the resolved dependency set:
 
 ```bash
 npm ci --ignore-scripts
 npm run ci
 ```
 
-The suite covers queue/edit invariants, command classification, images, one-at-a-time and all-mode delivery, synchronous partial handoff restoration, non-TUI pass-through, prompt and Skill expansion, manual compaction success/failure, automatic overflow compaction, retry ordering, repeated reload restoration, and compaction/native-input ordering.
-
-To verify against Pi 0.84.1 without changing the pinned baseline or lockfile:
+Refresh to the current Pi packages before compatibility review:
 
 ```bash
-rm -rf /tmp/pi-queue-steer-0841
-mkdir /tmp/pi-queue-steer-0841
-rsync -a --exclude=.git --exclude=node_modules --exclude=.pi-subagents . /tmp/pi-queue-steer-0841/
-cd /tmp/pi-queue-steer-0841
-npm install --ignore-scripts --no-save \
-  @earendil-works/pi-ai@0.84.1 \
-  @earendil-works/pi-coding-agent@0.84.1 \
-  @earendil-works/pi-tui@0.84.1
+npm update --ignore-scripts \
+  @earendil-works/pi-ai \
+  @earendil-works/pi-coding-agent \
+  @earendil-works/pi-tui
 npm run ci
 ```
 
-Latest result on both dependency sets: 81 tests passed.
+The suite covers queue/edit invariants, command classification, images, one-at-a-time and all-mode delivery, synchronous partial handoff restoration, non-TUI pass-through, prompt and Skill expansion, manual compaction success/failure, automatic overflow compaction, retry ordering, repeated reload restoration, and compaction/native-input ordering.
+
+Latest result with Pi 0.84.1: 81 tests passed.
 
 ## Real TUI evidence
 

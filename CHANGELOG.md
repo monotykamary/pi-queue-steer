@@ -12,6 +12,7 @@
 - Rebind editor guards across runtime reloads and capture command rows even while slash autocomplete is visible.
 - Normalize native post-compaction input classification so whitespace and immediate hidden built-ins cannot strand queued rows.
 - Add deterministic AgentSession retry coverage and a reproducible real-TUI evidence harness for manual/overflow compaction, abort recovery, native ordering, repeated reloads, resources and all-mode delivery.
+- Keep Pi package ranges unpinned so compatibility validation follows current Pi releases.
 
 - Add command rows: `/compact [instructions]` and `/reload` queue in FIFO position and execute only once the agent is idle, so rows behind them wait — e.g. a queued `continue` delivers after compaction completes.
 - Queue a mid-run `Enter` on `/reload` instead of surfacing Pi's built-in "wait until the agent finishes" warning; mid-run `Enter` on `/compact` uses Pi's public compaction API and holds queued rows until compaction settles.
