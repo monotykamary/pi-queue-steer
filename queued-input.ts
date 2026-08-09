@@ -10,7 +10,7 @@ import {
 const PI_BUILTIN_COMMANDS = new Set([
 	"settings", "model", "scoped-models", "export", "import", "share", "copy", "name", "session",
 	"changelog", "hotkeys", "fork", "clone", "tree", "trust", "login", "logout", "new", "compact",
-	"resume", "reload", "quit",
+	"resume", "reload", "quit", "debug", "arminsayshi", "dementedelves",
 ]);
 
 // Pi does not export its prompt argument parser or substitution helper.
@@ -40,10 +40,13 @@ function parseCommandArgs(argsString: string): string[] {
 function substituteArgs(content: string, args: readonly string[]): string {
 	const allArgs = args.join(" ");
 	return content.replace(
-		/\$\{(\d+):-([^}]*)\}|\$\{@:(\d+)(?::(\d+))?\}|\$(ARGUMENTS|@|\d+)/g,
+		/\$\{(\d+|ARGUMENTS|@):-([^}]*)\}|\$\{@:(\d+)(?::(\d+))?\}|\$(ARGUMENTS|@|\d+)/g,
 		(_match, defaultTarget, defaultValue, sliceStart, sliceLength, simple: string | undefined) => {
 			if (defaultTarget) {
-				return args[Number.parseInt(defaultTarget, 10) - 1] || defaultValue;
+				const value = defaultTarget === "@" || defaultTarget === "ARGUMENTS"
+					? allArgs
+					: args[Number.parseInt(defaultTarget, 10) - 1];
+				return value || defaultValue;
 			}
 			if (sliceStart) {
 				const start = Math.max(0, Number.parseInt(sliceStart, 10) - 1);
@@ -56,6 +59,28 @@ function substituteArgs(content: string, args: readonly string[]): string {
 			return args[Number.parseInt(simple ?? "", 10) - 1] ?? "";
 		},
 	);
+}
+
+/** Whether Pi's TUI parks this submit in its private post-compaction queue. */
+export function queuesDuringCompaction(
+	text: string,
+	commands: readonly SlashCommandInfo[],
+	behavior: "submit" | "followUp" = "submit",
+): boolean {
+	const normalized = text.trim();
+	if (!normalized) return false;
+	const invocation = /^\/([^\s]+)/.exec(normalized);
+	const name = invocation?.[1];
+	const extensionCommand = name
+		? commands.some((command) => command.source === "extension" && command.name === name)
+		: false;
+	// Pi's follow-up action parks everything except extension commands. Regular
+	// submit executes bash, built-ins and extension commands before its queue.
+	if (behavior === "followUp") return !extensionCommand;
+	if (normalized.startsWith("!")) return false;
+	if (!name) return true;
+	if (PI_BUILTIN_COMMANDS.has(name)) return false;
+	return !extensionCommand;
 }
 
 export function expandQueuedInput(text: string, commands: readonly SlashCommandInfo[]): string {
