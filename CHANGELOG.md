@@ -2,37 +2,34 @@
 
 ## Unreleased
 
-- Expand queued prompt templates and Agent Skills at delivery, with arguments, images, short aliases such as `/bro`, and full-batch restoration if expansion fails.
-- Make command rows compaction-aware: idle `/compact` uses Pi's public compaction API, `/reload` waits for direct or automatic compaction to settle, and ordinary messages stay in Pi's native compaction queue.
-- Preserve stable row IDs, lanes, attachments and pause state when committed rows cross a `/reload` runtime swap, including rows added after reload scheduling and repeated queued reloads.
-- Keep image-bearing command text as a normal queued message so attachments are never discarded.
-- Hold queued follow-ups while Pi decides whether an error, length stop or context overflow needs retry or automatic compaction.
-- Restore and pause `/compact` when compaction cannot start, and restore only an unsent all-mode tail after a synchronous partial handoff failure.
-- Leave RPC, JSON and print-mode input unchanged; queue ownership is TUI-only.
-- Rebind editor guards across runtime reloads and capture command rows even while slash autocomplete is visible.
-- Normalize native post-compaction input classification so whitespace and immediate hidden built-ins cannot strand queued rows.
-- Add deterministic AgentSession retry coverage and a reproducible real-TUI evidence harness for manual/overflow compaction, abort recovery, native ordering, repeated reloads, resources and all-mode delivery.
+## 0.2.0 - 2026-08-09
+
+### Added
+
+- Add independent steering and follow-up lanes in one delivery-ordered timeline, with stacked blue and yellow boxes and a compact looping demo.
+- Add multi-row inline editing with visual navigation, stable row IDs, snapshot rollback, empty-row removal, image-only row support, safe head pinning and composer-draft restoration.
+- Add `Option+X` removal marks and `Option+T` lane toggles, including destination previews and explicit save semantics.
+- Add FIFO command rows for text-only `/compact [instructions]` and `/reload`; image-bearing matches remain normal messages so attachments are preserved.
+- Expand queued prompt templates and Agent Skills at delivery, including arguments, images and non-shadowing short aliases such as `/bro`; unsupported extension commands pause for editing or removal.
+
+### Changed
+
+- Preserve Pi's native steering and continuation timing, independent `one-at-a-time` and `all` modes, normal transcript entries and explicit pause/resume after aborts.
+- Coordinate command rows with manual and automatic compaction, retries and Pi-native post-compaction input. Native queued input can run before extension-owned command rows after compaction completes.
+- Queue busy `/reload` submissions rather than surfacing Pi's wait warning, and hold `/reload` until direct or automatic compaction settles.
+- Preserve committed row IDs, lanes, attachments and pause state across direct and repeated `/reload` runtime swaps, including rows added after reload scheduling. Unsaved edit drafts do not cross reload.
+- Keep queue ownership TUI-only so RPC, JSON and print-mode input remain unchanged.
 - Keep Pi package ranges unpinned so compatibility validation follows current Pi releases.
 
-- Add command rows: `/compact [instructions]` and `/reload` queue in FIFO position and execute only once the agent is idle, so rows behind them wait — e.g. a queued `continue` delivers after compaction completes.
-- Queue a mid-run `Enter` on `/reload` instead of surfacing Pi's built-in "wait until the agent finishes" warning; mid-run `Enter` on `/compact` uses Pi's public compaction API and holds queued rows until compaction settles.
-- Restore rows queued behind a `/reload` after the runtime swap.
-- Execute idle `Option+Enter` command submissions instead of letting them reach the LLM as text.
+### Fixed
 
-- Add `Option+X` to mark the selected row for removal — deleted on save, restored by `Escape` or a second press, and finally covering image-only rows.
-- Add `Option+T` to re-lane the selected row between steering and follow-up, previewing at its destination tail before the save commits it.
-- Navigate row selection through the visual timeline so lane previews and `Option+Up`/`Option+Down` movement stay aligned.
+- Hold follow-ups while Pi decides whether errors, length stops or context overflows require retry or automatic compaction.
+- Restore and pause `/compact` when compaction cannot start, restore expansion failures without reordering and restore only the unsent all-mode tail after a synchronous partial handoff failure.
+- Rebind editor guards across runtime reloads, capture command rows while slash autocomplete is visible and normalize native-input classification so hidden or whitespace input cannot strand queued rows.
 
-- Show steering and follow-ups as separate lanes in one delivery-ordered timeline.
-- Group the lanes into stacked blue and yellow boxes with aligned inline editing.
-- Add a compact looping demo in the original GitHub Dark terminal treatment, starting on a populated screen.
-- Keep steering rows editable until Pi's native turn boundary.
-- Honour Pi's independent `one-at-a-time` and `all` modes at active-run delivery boundaries.
-- Add `Option+Down` navigation and recency-first `Option+Up` selection.
-- Pin edited heads so asynchronous delivery cannot consume a row under the cursor.
-- Stash unrelated composer text and remove empty text-only rows on save.
-- Pause both lanes after an abort and require an explicit empty `Enter` to resume.
-- Feed follow-ups into Pi's native continuation queue to preserve transcript and run semantics.
+### Validation
+
+- Add 81 automated tests plus a reproducible real-TUI evidence harness for manual and overflow compaction, abort recovery, native ordering, repeated reloads, resource expansion and all-mode delivery.
 
 ## 0.1.0 — 2026-07-16
 

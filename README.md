@@ -21,10 +21,10 @@ Install the latest version from GitHub:
 pi install git:github.com/tmustier/pi-queue-steer
 ```
 
-Pin the first release:
+Pin the current release:
 
 ```bash
-pi install git:github.com/tmustier/pi-queue-steer@v0.1.0
+pi install git:github.com/tmustier/pi-queue-steer@v0.2.0
 ```
 
 Then start a new Pi session or run `/reload`.
@@ -85,7 +85,7 @@ Text-only rows whose text is exactly `/compact`, `/compact <instructions>` or `/
 - idle `/compact` uses Pi’s public compaction API so queued rows resume when compaction finishes; a start failure restores and pauses the command row
 - `/reload` submitted while the agent works or tracked compaction runs stays queued instead of showing Pi’s built-in wait warning
 - `Enter` on `/compact` while the agent works uses Pi’s public compaction API and holds visible rows until compaction settles
-- ordinary messages submitted during compaction remain in Pi’s native queue
+- ordinary messages submitted during compaction remain in Pi’s native queue and can run before extension-owned command rows after compaction finishes
 - `Option+Enter` on a command while the agent is idle executes it immediately instead of sending the text to the model
 - command rows show a `⚙` marker and pause, resume and edit like any other row; editing a row into or out of command form just works
 

@@ -43,7 +43,7 @@ The latest complete run reported:
 
 ```text
 pi: 0.84.1
-commit: <reviewed commit>
+commit: 37fcd1433b8960f13c030d9ba1a5e8cc36535e05
 working tree: clean
 manual events: {"event":"session_before_compact","reason":"manual"} {"event":"session_before_compact","reason":"manual"}
 overflow events: {"event":"session_before_compact","reason":"overflow"} {"event":"session_before_compact","reason":"threshold"}
@@ -76,7 +76,7 @@ PROMPT EXPANDED: first=alpha all=alpha beta default=fallback
 FAUX RESPONSE: <skill name="bro" ...>
 ```
 
-The native post-compaction ordering capture showed the ordinary native message finishing before the extension-owned command, and `/reload` never reached the model:
+The native post-compaction ordering capture showed the ordinary message submitted during manual `/compact` entering Pi's native queue, finishing before the extension-owned command row, and `/reload` never reaching the model:
 
 ```text
 [compaction]
@@ -87,6 +87,14 @@ Reloaded keybindings, extensions, skills, prompts, themes, and context files
 ```
 
 The overflow event log recorded `reason: "overflow"`, the TUI rendered a compaction entry, and `overflow-provider-calls.jsonl` proved the queued follow-up completed exactly once. `all-mode-provider-calls.jsonl` proved all three rows reached Pi exactly once in FIFO order; the all-mode capture rendered them together before the final response.
+
+## Normal-Pi adversarial evidence
+
+PR [#9](https://github.com/tmustier/pi-queue-steer/pull/9) was also exercised at commit `37fcd1433b8960f13c030d9ba1a5e8cc36535e05` through normal `pi` execution under tmux, using the installed extension and Pi 0.84.1 rather than extension-selection or test-fixture flags. The three captures cover automatic compaction above 200k tokens followed by queued `/reload`, manual `/compact` with Pi-native queued input ahead of an extension-owned `/reload`, and abort recovery with repeated queued reloads.
+
+The [public evidence comment](https://github.com/tmustier/pi-queue-steer/pull/9#issuecomment-5231404721) embeds the replacement Menlo-rendered videos and screenshots. Its [reproducible evidence bundle](https://github.com/user-attachments/files/30873175/pi-queue-steer-normal-pi-evidence-37fcd14.zip) has SHA-256 `c6b1150f13fccc195eb5747aa6af63c4589b73df116e3d36d27e92fb85a45e98`. The archive contains machine-checked assertions, tapes, captures, deterministic-suite output and bounded sanitized session proof slices.
+
+This evidence confirms the public API boundary: ordinary input submitted while manual compaction is active belongs to Pi's native post-compaction queue and can execute before extension-owned command rows resume.
 
 ## Public API boundary
 
