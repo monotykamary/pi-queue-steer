@@ -1,4 +1,5 @@
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import { isContextOverflow } from "@earendil-works/pi-ai/compat";
 import {
 	CustomEditor,
 	keyText,
@@ -10,7 +11,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth, type Component, type EditorComponent } from "@earendil-works/pi-tui";
 import { extractInlineEditorLines } from "./editor-render.ts";
-import { expandQueuedInput } from "./queued-input.ts";
+import { expandQueuedInput, queuesDuringCompaction } from "./queued-input.ts";
 import {
 	DeliveryQueue,
 	parseQueuedCommand,
@@ -24,20 +25,16 @@ const WIDGET_ID = "queue-steer.timeline";
 const EDITOR_FEATURES = Symbol.for("@tmustier/pi-editor-features");
 const QUEUE_STEER_FEATURE = "queue-steer";
 const NEXT_ROW_KEY = "alt+down";
-const RELOAD_STASH_KEY = "@tmustier/pi-queue-steer.reload-stash";
 const SUBMIT_GUARD = Symbol.for("@tmustier/pi-queue-steer.submit-guard");
 
-/** Rows surviving a queued /reload, parked on globalThis across the runtime swap. */
-interface ReloadStashRow {
-	lane: QueueLane;
-	text: string;
-	images: ImageContent[];
-}
+/** Queue state parked on globalThis across Pi's in-process runtime swap. */
 interface ReloadStash {
-	at: number;
-	rows: ReloadStashRow[];
+	paused: boolean;
+	rows: QueuedMessage<ImageContent>[];
 }
-const globalStore = globalThis as unknown as Record<string, unknown>;
+declare global {
+	var __tmustierPiQueueSteerReloadStash: ReloadStash | undefined;
+}
 const REMOVE_ROW_KEY = "alt+x";
 const TOGGLE_LANE_KEY = "alt+t";
 
@@ -232,18 +229,37 @@ function userContent(item: QueuedMessage<ImageContent>): string | (TextContent |
 	return [{ type: "text", text: item.text }, ...item.images];
 }
 
+function itemCommand(item: Pick<QueuedMessage<ImageContent>, "text" | "images">): QueuedCommand | undefined {
+	// Treat an image-bearing row as a message so executing a command can never
+	// silently discard its attachments.
+	return item.images.length === 0 ? parseQueuedCommand(item.text) : undefined;
+}
+
 export default function queueSteerExtension(pi: ExtensionAPI) {
 	const queue = new DeliveryQueue<ImageContent>();
 	let editSession: QueueEditSession<ImageContent> | undefined;
 	let activeContext: ExtensionContext | undefined;
 	let renderInlineEditor: InlineEditorRenderer | undefined;
 	let editorInstallTimer: ReturnType<typeof setTimeout> | undefined;
+	let baseEditorFactory: EditorFactory | undefined;
+	let baseEditorFactoryCaptured = false;
+	let reloadSubmitTimer: ReturnType<typeof setTimeout> | undefined;
 	let renderingInline = false;
 	let paused = false;
 	let settingsManager: SettingsManager | undefined;
 	let blockingActivity: "compact" | "auto-compact" | "reload" | undefined;
 	let compactionFinishTimer: ReturnType<typeof setTimeout> | undefined;
+	let nativeCompactionInputQueued = false;
+	let nativeCompactionTurnStarted = false;
 	const isCompacting = (): boolean => blockingActivity === "compact" || blockingActivity === "auto-compact";
+	const trackNativeCompactionSubmission = (
+		text: string,
+		behavior: "submit" | "followUp" = "submit",
+	): void => {
+		if (isCompacting() && queuesDuringCompaction(text, pi.getCommands(), behavior)) {
+			nativeCompactionInputQueued = true;
+		}
+	};
 	// Pi's own editor submit handler, captured by the submit guard. Replaying text
 	// through it is the only public route to the built-in /reload.
 	let tuiSubmit: ((text: string) => void) | undefined;
@@ -291,15 +307,16 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		const decorated = queue.snapshot().map((item): TimelineItem => {
 			const lane = editSession?.laneFor(item.id) ?? item.lane;
 			const text = editSession?.textFor(item.id) ?? item.text;
+			const images = editSession?.imagesFor(item.id) ?? item.images;
 			return {
 				...item,
 				text,
-				images: editSession?.imagesFor(item.id) ?? item.images,
+				images,
 				lane,
 				removed: editSession?.isRemoved(item.id) ?? false,
 				movedLane: lane !== item.lane,
 				held: heldLane[item.lane] && (modes[item.lane] === "all" || heads[item.lane] === item.id),
-				command: parseQueuedCommand(text),
+				command: itemCommand({ text, images }),
 			};
 		});
 		return [
@@ -337,7 +354,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 	// agent settles and dispatchFromIdle executes it.
 	const takeLaneBatch = (lane: QueueLane): QueuedMessage<ImageContent>[] => {
 		if (paused || blockingActivity || queue.laneLength(lane) === 0 || laneIsHeld(lane)) return [];
-		const isMessage = (item: QueuedMessage<ImageContent>) => parseQueuedCommand(item.text) === undefined;
+		const isMessage = (item: QueuedMessage<ImageContent>) => itemCommand(item) === undefined;
 		if (queueModes()[lane] === "all") return queue.shiftWhile(lane, isMessage);
 		const head = queue.peek(lane);
 		if (!head || !isMessage(head)) return [];
@@ -360,23 +377,19 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 			pauseAfterPreparationFailure(ctx, lane, error);
 			return false;
 		}
-		const pendingBefore = ctx.hasPendingMessages();
 		renderQueue(ctx);
+		let submitted = 0;
 		try {
 			for (const item of prepared) {
 				pi.sendUserMessage(userContent(item), { deliverAs: lane });
+				submitted += 1;
 			}
-			// sendUserMessage is fire-and-forget. Keep the awaited boundary
-			// handler open until async input preflight reaches Pi's native queue.
-			for (let attempt = 0; attempt < 5 && !ctx.hasPendingMessages(); attempt += 1) {
-				await new Promise<void>((resolve) => setTimeout(resolve, 0));
-			}
-			if (!pendingBefore && !ctx.hasPendingMessages()) {
-				throw new Error("Pi did not accept the queued message at this delivery boundary");
-			}
+			// The public send API is fire-and-forget. Once invoked, do not infer
+			// rejection from aggregate queue timing: a delayed preflight could
+			// otherwise accept the original after we restored and duplicate it.
 			return true;
 		} catch (error) {
-			queue.prependMany(items);
+			queue.prependMany(items.slice(submitted));
 			renderQueue(ctx);
 			ctx.ui.notify(
 				`Could not deliver queued ${laneLabel(lane)}: ${error instanceof Error ? error.message : String(error)}`,
@@ -398,35 +411,33 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 
 	// Execute the command row at the lane head. Only called when the agent is idle.
 	const executeCommandRow = (ctx: ExtensionContext, lane: QueueLane): boolean => {
-		const next = queue.shift(lane);
+		const next = queue.peek(lane);
 		if (!next) return false;
-		const command = parseQueuedCommand(next.text);
-		if (!command) {
-			queue.prepend(next);
+		const command = itemCommand(next);
+		if (!command) return false;
+		const submit = tuiSubmit;
+		if (command.kind === "reload" && !submit) {
+			paused = true;
+			renderQueue(ctx);
+			ctx.ui.notify("Could not run queued /reload; queue paused because no interactive submit handler is available", "error");
 			return false;
 		}
+		queue.shift(lane);
 		paused = false;
 		renderQueue(ctx);
 		if (command.kind === "compact") {
-			startCompaction(ctx, command.instructions);
-			return true;
-		}
-		const submit = tuiSubmit;
-		if (!submit) {
-			ctx.ui.notify("Queued /reload dropped: no interactive editor to run it through", "error");
+			if (startCompaction(ctx, command.instructions)) return true;
+			queue.prepend(next);
+			paused = true;
 			renderQueue(ctx);
 			return false;
 		}
-		if (queue.length > 0) {
-			const stash: ReloadStash = {
-				at: Date.now(),
-				rows: queue.snapshot().map((item) => ({ lane: item.lane, text: item.text, images: item.images })),
-			};
-			globalStore[RELOAD_STASH_KEY] = stash;
-		}
 		blockingActivity = "reload";
 		// Defer so the extension runtime is never torn down from inside this handler.
-		setTimeout(() => submit("/reload"), 0);
+		reloadSubmitTimer = setTimeout(() => {
+			reloadSubmitTimer = undefined;
+			submit?.("/reload");
+		}, 0);
 		return true;
 	};
 
@@ -473,7 +484,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 			return false;
 		}
 		const head = queue.peek(lane);
-		if (head && parseQueuedCommand(head.text)) return executeCommandRow(ctx, lane);
+		if (head && itemCommand(head)) return executeCommandRow(ctx, lane);
 		return sendHeadMessage(ctx, lane);
 	};
 
@@ -484,20 +495,44 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		compactionFinishTimer = setTimeout(() => {
 			compactionFinishTimer = undefined;
 			if (blockingActivity !== activity) return;
+			// Pi flushes ordinary TUI submissions after compaction without
+			// awaiting prompt preflight. Keep command rows behind that native run.
+			if (nativeCompactionInputQueued) {
+				renderQueue(activeContext ?? ctx);
+				return;
+			}
 			blockingActivity = undefined;
+			nativeCompactionInputQueued = false;
+			nativeCompactionTurnStarted = false;
 			const current = activeContext ?? ctx;
 			renderQueue(current);
 			if (!paused && !editSession && queue.length > 0 && current.isIdle()) dispatchFromIdle(current);
 		}, 0);
 	};
 
-	const startCompaction = (ctx: ExtensionContext, instructions: string | undefined): void => {
+	const startCompaction = (ctx: ExtensionContext, instructions: string | undefined): boolean => {
 		blockingActivity = "compact";
-		ctx.compact({
-			customInstructions: instructions,
-			onComplete: () => deferCompactionFinish(ctx, "compact"),
-			onError: () => deferCompactionFinish(ctx, "compact"),
-		});
+		nativeCompactionInputQueued = false;
+		nativeCompactionTurnStarted = false;
+		try {
+			ctx.compact({
+				customInstructions: instructions,
+				onComplete: () => {
+					if (!nativeCompactionInputQueued) deferCompactionFinish(ctx, "compact");
+				},
+				onError: () => {
+					if (!nativeCompactionInputQueued) deferCompactionFinish(ctx, "compact");
+				},
+			});
+			return true;
+		} catch (error) {
+			blockingActivity = undefined;
+			ctx.ui.notify(
+				`Could not start compaction: ${error instanceof Error ? error.message : String(error)}`,
+				"error",
+			);
+			return false;
+		}
 	};
 
 	const deferCommand = (ctx: ExtensionContext, text: string): void => {
@@ -509,7 +544,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 	const sendFollowUpNow = (ctx: ExtensionContext): boolean => {
 		const head = queue.peek("followUp");
 		if (!head) return false;
-		const headCommand = parseQueuedCommand(head.text);
+		const headCommand = itemCommand(head);
 		if (headCommand) {
 			if (blockingActivity === "reload" || !ctx.isIdle()) {
 				ctx.ui.notify(`Queued /${headCommand.kind} runs when the agent is idle`, "info");
@@ -649,7 +684,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 					}
 				}
 
-				if (keybindings.matches(data, "app.message.followUp") && !isShowingAutocomplete()) {
+				if (keybindings.matches(data, "app.message.followUp")) {
 					const text = (editor.getExpandedText?.() ?? editor.getText()).trim();
 					if (isCompacting() && parseQueuedCommand(text)) {
 						deferCommand(ctx, text);
@@ -657,6 +692,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 						editor.setText("");
 						return;
 					}
+					trackNativeCompactionSubmission(text, "followUp");
 				}
 
 				if (queue.length > 0 && keybindings.matches(data, "app.message.dequeue")) {
@@ -699,6 +735,13 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 			return editor;
 		}) as ComposedEditorFactory;
 		factory[EDITOR_FEATURES] = new Set([...features, QUEUE_STEER_FEATURE]);
+		// Preserve the factory from before this runtime's first wrapper. A later
+		// unmarked composer may itself close over our wrapper; restoring that on
+		// reload would carry stale submit guards into the replacement runtime.
+		if (!baseEditorFactoryCaptured) {
+			baseEditorFactory = previousFactory;
+			baseEditorFactoryCaptured = true;
+		}
 		ctx.ui.setEditorComponent(factory);
 		renderQueue(ctx);
 	};
@@ -717,7 +760,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 				editor.setText("");
 				return;
 			}
-			if (command?.kind === "compact" && !editSession && ctx.isIdle()) {
+			if (command?.kind === "compact" && !editSession) {
 				editor.addToHistory?.(text);
 				editor.setText("");
 				startCompaction(ctx, command.instructions);
@@ -729,6 +772,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 				renderQueue(ctx);
 				return;
 			}
+			if (!editSession) trackNativeCompactionSubmission(text);
 			innerSubmit?.(text);
 		};
 		Object.defineProperty(editor, "onSubmit", {
@@ -769,7 +813,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("input", (event, ctx) => {
-		if (event.source !== "interactive") return { action: "continue" };
+		if (ctx.mode !== "tui" || event.source !== "interactive") return { action: "continue" };
 		activeContext = ctx;
 
 		// Safety net for editor wrappers installed after ours: an editing submit
@@ -788,7 +832,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		}
 
 		// Alt+Enter can bypass Pi's built-in command dispatch while idle.
-		if (event.streamingBehavior === undefined && command && ctx.isIdle()) {
+		if (event.streamingBehavior === undefined && command && (event.images?.length ?? 0) === 0 && ctx.isIdle()) {
 			queue.enqueue("followUp", event.text, event.images ?? []);
 			paused = false;
 			renderQueue(ctx);
@@ -803,7 +847,14 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		activeContext = ctx;
 		if (blockingActivity || event.reason === "manual") return;
 		blockingActivity = "auto-compact";
+		nativeCompactionInputQueued = false;
+		nativeCompactionTurnStarted = false;
 		renderQueue(ctx);
+	});
+
+	pi.on("turn_start", (_event, ctx) => {
+		activeContext = ctx;
+		if (isCompacting() && nativeCompactionInputQueued) nativeCompactionTurnStarted = true;
 	});
 
 	pi.on("turn_end", async (event, ctx) => {
@@ -820,9 +871,22 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 	// Pi checks its native queues again after extension agent_end handlers.
 	// Feeding one item (or an all-mode batch) here preserves native follow-up
 	// continuation semantics without relinquishing later editable rows early.
-	pi.on("agent_end", async (_event, ctx) => {
+	pi.on("agent_end", async (event, ctx) => {
 		activeContext = ctx;
 		if (paused) return;
+		const lastMessage = event.messages.at(-1);
+		if (
+			lastMessage?.role === "assistant"
+			&& (
+				lastMessage.stopReason === "length"
+				|| lastMessage.stopReason === "error"
+				|| isContextOverflow(lastMessage, ctx.model?.contextWindow ?? 0)
+			)
+		) {
+			// Pi decides whether to retry or auto-compact only after agent_end.
+			// Injecting a follow-up here would start it first and hide that signal.
+			return;
+		}
 		if (queue.laneLength("steer") > 0) {
 			await dispatchLaneAtBoundary(ctx, "steer");
 			return;
@@ -832,36 +896,66 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 
 	pi.on("agent_settled", (_event, ctx) => {
 		activeContext = ctx;
-		if (blockingActivity === "auto-compact") {
-			deferCompactionFinish(ctx, "auto-compact");
+		if (blockingActivity === "compact" || blockingActivity === "auto-compact") {
+			const activity = blockingActivity;
+			if (nativeCompactionInputQueued && !nativeCompactionTurnStarted) {
+				renderQueue(ctx);
+				return;
+			}
+			// The ordinary post-compaction turn, if any, is now fully settled.
+			nativeCompactionInputQueued = false;
+			deferCompactionFinish(ctx, activity);
 			return;
 		}
 		renderQueue(ctx);
 		if (!paused && !editSession && queue.length > 0 && ctx.isIdle() && !blockingActivity) dispatchFromIdle(ctx);
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", (event) => {
+		if (event.reason === "reload" && queue.length > 0) {
+			const stash: ReloadStash = { paused, rows: queue.snapshot() };
+			globalThis.__tmustierPiQueueSteerReloadStash = stash;
+		} else {
+			globalThis.__tmustierPiQueueSteerReloadStash = undefined;
+		}
 		if (editorInstallTimer) clearTimeout(editorInstallTimer);
+		if (reloadSubmitTimer) clearTimeout(reloadSubmitTimer);
 		if (compactionFinishTimer) clearTimeout(compactionFinishTimer);
-		if (activeContext?.hasUI) activeContext.ui.setWidget(WIDGET_ID, undefined);
+		if (activeContext?.hasUI) {
+			const currentFactory = activeContext.ui.getEditorComponent();
+			if (
+				baseEditorFactoryCaptured
+				&& currentFactory
+				&& editorFeatures(currentFactory).has(QUEUE_STEER_FEATURE)
+			) {
+				activeContext.ui.setEditorComponent(baseEditorFactory);
+			}
+			activeContext.ui.setWidget(WIDGET_ID, undefined);
+		}
 		activeContext = undefined;
 		renderInlineEditor = undefined;
 		editorInstallTimer = undefined;
+		baseEditorFactory = undefined;
+		baseEditorFactoryCaptured = false;
+		reloadSubmitTimer = undefined;
 		compactionFinishTimer = undefined;
 		editSession = undefined;
 		settingsManager = undefined;
 		paused = false;
 		blockingActivity = undefined;
+		nativeCompactionInputQueued = false;
+		nativeCompactionTurnStarted = false;
 		tuiSubmit = undefined;
 		queue.clear();
 	});
 
-	/** Re-adopt rows that a queued /reload parked across the runtime swap. */
+	/** Re-adopt committed queue state after Pi's in-process runtime swap. */
 	function restoreReloadStash(reason: string, ctx: ExtensionContext): void {
-		const stash = globalStore[RELOAD_STASH_KEY] as ReloadStash | undefined;
-		delete globalStore[RELOAD_STASH_KEY];
-		if (!stash || reason !== "reload" || Date.now() - stash.at > 30_000 || stash.rows.length === 0) return;
-		for (const row of stash.rows) queue.enqueue(row.lane, row.text, row.images);
+		const stash = globalThis.__tmustierPiQueueSteerReloadStash;
+		globalThis.__tmustierPiQueueSteerReloadStash = undefined;
+		if (!stash || reason !== "reload" || stash.rows.length === 0) return;
+		queue.restore(stash.rows);
+		paused = stash.paused;
 		ctx.ui.notify(`Restored ${stash.rows.length} queued row${stash.rows.length === 1 ? "" : "s"} after reload`, "info");
 		setTimeout(() => {
 			const current = activeContext;

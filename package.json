@@ -27,6 +27,7 @@
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
+    "docs/validation.md",
     "assets/pi-queue-steer-demo.gif"
   ],
   "scripts": {

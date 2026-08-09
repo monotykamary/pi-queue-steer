@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import type { ImageContent } from "@earendil-works/pi-ai";
 import type { CompactOptions, SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import queueSteerExtension from "../index.ts";
@@ -59,6 +60,28 @@ test("restores failed batches at the front in their original order", () => {
 	queue.prependMany(failed);
 
 	assert.deepEqual(queue.laneSnapshot("followUp").map((item) => item.text), ["first", "second", "third"]);
+});
+
+test("restores queue snapshots with stable IDs, recency, images, and collision-free counters", () => {
+	const original = new DeliveryQueue<string>();
+	const first = original.enqueue("steer", "first", ["one.png"]);
+	const mostRecent = original.enqueue("followUp", "second", ["two.png"]);
+	const snapshot = original.snapshot();
+
+	const restored = new DeliveryQueue<string>();
+	restored.restore(snapshot);
+	assert.deepEqual(restored.snapshot(), snapshot);
+	assert.equal(restored.mostRecentId(), mostRecent.id);
+	assert.equal(restored.get(first.id)?.images[0], "one.png");
+	const next = restored.enqueue("steer", "third");
+	assert.equal(next.id, "steer-3");
+	assert.ok(next.sequence > mostRecent.sequence);
+});
+
+test("rejects duplicate row IDs in restored snapshots", () => {
+	const queue = new DeliveryQueue();
+	const row = queue.enqueue("steer", "one");
+	assert.throws(() => queue.restore([row, { ...row, text: "duplicate" }]), /Duplicate queued row ID/);
 });
 
 test("edit sessions keep cross-lane drafts private until commit", () => {
@@ -135,8 +158,17 @@ test("toggling a lane twice leaves the row untouched at commit", () => {
 
 class MockEditor {
 	private text = "";
+	private autocompleteVisible = false;
 	onSubmit?: (text: string) => void;
 	onChange?: (text: string) => void;
+
+	setAutocompleteVisible(visible: boolean): void {
+		this.autocompleteVisible = visible;
+	}
+
+	isShowingAutocomplete(): boolean {
+		return this.autocompleteVisible;
+	}
 
 	getText(): string {
 		return this.text;
@@ -169,6 +201,10 @@ function createHarness(options: {
 	cwd?: string;
 	projectTrusted?: boolean;
 	commands?: SlashCommandInfo[];
+	mode?: "tui" | "rpc" | "json" | "print";
+	sendFailureAt?: number;
+	compactStartError?: Error;
+	autocompleteVisible?: boolean;
 } = {}) {
 	type Handler = (event: any, context: any) => any;
 	const handlers = new Map<string, Handler[]>();
@@ -179,9 +215,16 @@ function createHarness(options: {
 	let idle = false;
 	let pending = false;
 	let aborted = false;
-	let activeEditor = new MockEditor();
-	activeEditor.onSubmit = (text) => submitted.push(text);
-	let currentFactory: any = () => activeEditor;
+	const createDefaultEditor = (): MockEditor => {
+		const editor = new MockEditor();
+		editor.setAutocompleteVisible(options.autocompleteVisible ?? false);
+		editor.onSubmit = (text) => submitted.push(text);
+		return editor;
+	};
+	type MockEditorFactory = (_tui: unknown, _theme: unknown, _keybindings: unknown) => MockEditor;
+	let activeEditor = createDefaultEditor();
+	let currentFactory: MockEditorFactory = () => createDefaultEditor();
+	let editorInstallCount = 0;
 	let widget: unknown;
 
 	const keybindings = {
@@ -197,7 +240,8 @@ function createHarness(options: {
 
 	const ui = {
 		getEditorComponent: () => currentFactory,
-		setEditorComponent(factory: any) {
+		setEditorComponent(factory: MockEditorFactory) {
+			editorInstallCount += 1;
 			currentFactory = factory;
 			activeEditor = factory({}, {}, keybindings);
 		},
@@ -211,9 +255,10 @@ function createHarness(options: {
 		},
 	};
 
+	const mode = options.mode ?? "tui";
 	const context = {
-		mode: "tui",
-		hasUI: true,
+		mode,
+		hasUI: mode === "tui" || mode === "rpc",
 		cwd: options.cwd ?? DEFAULT_TEST_CWD,
 		ui,
 		isIdle: () => idle,
@@ -222,8 +267,9 @@ function createHarness(options: {
 		abort() {
 			aborted = true;
 		},
-		compact(options: CompactOptions = {}) {
-			compactCalls.push(options);
+		compact(compactOptions: CompactOptions = {}) {
+			if (options.compactStartError) throw options.compactStartError;
+			compactCalls.push(compactOptions);
 		},
 	};
 
@@ -233,9 +279,10 @@ function createHarness(options: {
 			registered.push(handler);
 			handlers.set(name, registered);
 		},
-		sendUserMessage(content: unknown, options?: unknown) {
-			sent.push({ content, options });
-			if (options) pending = true;
+		sendUserMessage(content: unknown, sendOptions?: unknown) {
+			if (options.sendFailureAt === sent.length + 1) throw new Error("synthetic send failure");
+			sent.push({ content, options: sendOptions });
+			if (sendOptions) pending = true;
 		},
 		getCommands: () => options.commands ?? [],
 	};
@@ -244,8 +291,11 @@ function createHarness(options: {
 
 	const emit = async (name: string, event: any = {}): Promise<any[]> => {
 		const results = [];
+		const emittedEvent = name === "agent_end" && event.messages === undefined
+			? { ...event, messages: [] }
+			: event;
 		for (const handler of handlers.get(name) ?? []) {
-			results.push(await handler(event, context));
+			results.push(await handler(emittedEvent, context));
 		}
 		return results;
 	};
@@ -262,6 +312,12 @@ function createHarness(options: {
 		get widget() {
 			return widget;
 		},
+		get editorInstallCount() {
+			return editorInstallCount;
+		},
+		get editorFactory() {
+			return currentFactory;
+		},
 		get aborted() {
 			return aborted;
 		},
@@ -273,6 +329,12 @@ function createHarness(options: {
 		},
 		replaceEditor(editor = new MockEditor()) {
 			ui.setEditorComponent(() => editor);
+		},
+		wrapEditorFactory() {
+			const wrappedFactory = currentFactory;
+			ui.setEditorComponent((tui, theme, editorKeybindings) => (
+				wrappedFactory(tui, theme, editorKeybindings)
+			));
 		},
 	};
 }
@@ -393,6 +455,80 @@ test("injects follow-ups through Pi's native continuation queue at agent_end", a
 	assert.match(renderWidget(harness), /later two/);
 });
 
+test("restores only the unsent tail after a synchronous all-mode batch failure", async () => {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-queue-partial-send-"));
+	mkdirSync(join(cwd, ".pi"));
+	writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ followUpMode: "all" }));
+	const harness = createHarness({ cwd, projectTrusted: true, sendFailureAt: 2 });
+	try {
+		await harness.emit("session_start");
+		await enqueue(harness, "followUp", "accepted first");
+		await enqueue(harness, "followUp", "restore second");
+		await enqueue(harness, "followUp", "restore third");
+
+		await harness.emit("agent_end");
+		assert.deepEqual(harness.sent.map((item) => item.content), ["accepted first"]);
+		const rendered = renderWidget(harness);
+		assert.doesNotMatch(rendered, /accepted first/);
+		assert.match(rendered, /restore second/);
+		assert.match(rendered, /restore third/);
+		assert.match(harness.notifications.at(-1)?.message ?? "", /synthetic send failure/);
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("restores an idle row after a synchronous send failure", async () => {
+	const harness = createHarness({ sendFailureAt: 1 });
+	await harness.emit("session_start");
+	harness.setIdle(true);
+	await enqueue(harness, "followUp", "retry me");
+
+	await harness.emit("agent_settled");
+	assert.equal(harness.sent.length, 0);
+	assert.match(renderWidget(harness), /retry me/);
+	assert.match(harness.notifications.at(-1)?.message ?? "", /synthetic send failure/);
+});
+
+test("delivers image-bearing command text as a message without dropping attachments", async () => {
+	const harness = createHarness();
+	const image: ImageContent = { type: "image", data: "AA==", mimeType: "image/png" };
+	await harness.emit("session_start");
+	await harness.emit("input", {
+		source: "interactive",
+		text: "/reload",
+		images: [image],
+		streamingBehavior: "followUp",
+	});
+
+	assert.doesNotMatch(renderWidget(harness), /command row/);
+	await harness.emit("agent_end");
+	assert.deepEqual(harness.sent[0], {
+		content: [{ type: "text", text: "/reload" }, image],
+		options: { deliverAs: "followUp" },
+	});
+	assert.deepEqual(harness.submitted, []);
+});
+
+test("does not take ownership of interactive-source input outside TUI mode", async () => {
+	const modes: ("rpc" | "json" | "print")[] = ["rpc", "json", "print"];
+	for (const mode of modes) {
+		const harness = createHarness({ mode });
+		await harness.emit("session_start", { reason: "startup" });
+		const results = await harness.emit("input", {
+			source: "interactive",
+			text: "/reload",
+			streamingBehavior: "followUp",
+		});
+		assert.deepEqual(results, [{ action: "continue" }]);
+		assert.equal(harness.sent.length, 0);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.equal(harness.compactCalls.length, 0);
+		assert.equal(harness.editorInstallCount, 0);
+		assert.equal(harness.widget, undefined);
+	}
+});
+
 test("honours Pi all-mode settings and pins the whole edited lane", async () => {
 	const cwd = mkdtempSync(join(tmpdir(), "pi-queue-steer-all-"));
 	mkdirSync(join(cwd, ".pi"));
@@ -418,6 +554,33 @@ test("honours Pi all-mode settings and pins the whole edited lane", async () => 
 		await enqueue(followUps, "followUp", "later two");
 		await followUps.emit("agent_end");
 		assert.deepEqual(followUps.sent.map((item) => item.content), ["later one", "later two"]);
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("restarts an all-mode lane in FIFO order after it stays pinned through settle", async () => {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-queue-steer-all-restart-"));
+	mkdirSync(join(cwd, ".pi"));
+	writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ followUpMode: "all" }));
+	try {
+		const harness = createHarness({ cwd, projectTrusted: true });
+		await harness.emit("session_start");
+		await enqueue(harness, "followUp", "restart one");
+		await enqueue(harness, "followUp", "restart two");
+		harness.editor.handleInput("alt-up");
+		await harness.emit("agent_end");
+		assert.equal(harness.sent.length, 0);
+
+		harness.setIdle(true);
+		await harness.emit("agent_settled");
+		harness.editor.handleInput("enter");
+		assert.deepEqual(harness.sent, [{ content: "restart one", options: undefined }]);
+		await harness.emit("agent_end");
+		assert.deepEqual(harness.sent, [
+			{ content: "restart one", options: undefined },
+			{ content: "restart two", options: { deliverAs: "followUp" } },
+		]);
 	} finally {
 		rmSync(cwd, { recursive: true, force: true });
 	}
@@ -687,7 +850,7 @@ test("expands queued prompt templates and short Agent Skill commands at delivery
 			{ name: "skill:bro", source: "skill", sourceInfo: sourceInfo(skillPath) },
 		],
 	});
-	const image = { type: "image", source: { type: "base64", mediaType: "image/png", data: "AA==" } };
+	const image: ImageContent = { type: "image", data: "AA==", mimeType: "image/png" };
 	try {
 		await harness.emit("session_start");
 		await harness.emit("input", {
@@ -765,7 +928,44 @@ test("keeps reload runnable when compact aborts a preflight prompt", async () =>
 	assert.deepEqual(harness.submitted, ["/reload"]);
 });
 
-test("leaves ordinary compaction input native and waits for its run", async () => {
+test("owns busy manual compaction so its abort does not pause queued rows", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	await enqueue(harness, "followUp", "continue after compact");
+
+	harness.editor.onSubmit?.("/compact preserve the queue");
+	assert.equal(harness.compactCalls[0]?.customInstructions, "preserve the queue");
+	await harness.emit("turn_end", { message: { role: "assistant", stopReason: "aborted" } });
+	assert.doesNotMatch(renderWidget(harness), /paused/);
+
+	harness.setIdle(true);
+	harness.compactCalls[0]?.onComplete?.({
+		summary: "summary",
+		firstKeptEntryId: "entry-1",
+		tokensBefore: 100,
+		estimatedTokensAfter: 20,
+	});
+	await waitFor(() => harness.sent.length === 1);
+	assert.equal(harness.sent[0]?.content, "continue after compact");
+});
+
+test("restores and pauses a command row when compaction cannot start", async () => {
+	const harness = createHarness({ compactStartError: new Error("cannot start") });
+	await harness.emit("session_start");
+	harness.setIdle(true);
+	await enqueue(harness, "followUp", "/compact");
+	await enqueue(harness, "followUp", "after compact");
+
+	await harness.emit("agent_settled");
+	const rendered = renderWidget(harness);
+	assert.match(rendered, /\/compact/);
+	assert.match(rendered, /after compact/);
+	assert.match(rendered, /paused/);
+	assert.match(harness.notifications.at(-1)?.message ?? "", /Could not start compaction: cannot start/);
+	assert.equal(harness.sent.length, 0);
+});
+
+test("leaves ordinary compaction input native and waits for its full run", async () => {
 	const harness = createHarness();
 	await harness.emit("session_start");
 	harness.setIdle(true);
@@ -779,7 +979,8 @@ test("leaves ordinary compaction input native and waits for its run", async () =
 	harness.editor.handleInput("alt-enter");
 	assert.match(renderWidget(harness), /\/reload/);
 
-	harness.setIdle(false);
+	// Real standalone compaction reports idle before Pi's unawaited TUI queue
+	// flush has reached agent_start. The reload must remain held through it.
 	harness.compactCalls[0]?.onComplete?.({
 		summary: "summary",
 		firstKeptEntryId: "entry-1",
@@ -789,10 +990,40 @@ test("leaves ordinary compaction input native and waits for its run", async () =
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	assert.deepEqual(harness.submitted, ["ordinary native message"]);
 
+	harness.setIdle(false);
+	await harness.emit("turn_start");
 	harness.setIdle(true);
 	await harness.emit("agent_settled");
 	await waitFor(() => harness.submitted.length === 2);
 	assert.deepEqual(harness.submitted, ["ordinary native message", "/reload"]);
+});
+
+test("holds a follow-up at a length stop so Pi can decide whether to auto-compact", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	await enqueue(harness, "followUp", "after overflow");
+	await harness.emit("agent_end", {
+		messages: [{ role: "assistant", stopReason: "length", content: [] }],
+	});
+	assert.equal(harness.sent.length, 0);
+
+	await harness.emit("session_before_compact", { reason: "overflow" });
+	harness.setIdle(true);
+	await harness.emit("agent_settled");
+	await waitFor(() => harness.sent.length === 1);
+	assert.equal(harness.sent[0]?.content, "after overflow");
+});
+
+test("releases a length-stop hold at settle when Pi does not compact", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	await enqueue(harness, "followUp", "after full-length output");
+	await harness.emit("agent_end", {
+		messages: [{ role: "assistant", stopReason: "length", content: [] }],
+	});
+	harness.setIdle(true);
+	await harness.emit("agent_settled");
+	assert.equal(harness.sent[0]?.content, "after full-length output");
 });
 
 test("holds reload through automatic compaction until the agent settles", async () => {
@@ -806,4 +1037,194 @@ test("holds reload through automatic compaction until the agent settles", async 
 	await harness.emit("agent_settled");
 	await waitFor(() => harness.submitted.length === 1);
 	assert.deepEqual(harness.submitted, ["/reload"]);
+});
+
+test("captures a compaction command while slash autocomplete is visible", async () => {
+	const harness = createHarness({ autocompleteVisible: true });
+	await harness.emit("session_start");
+	harness.setIdle(true);
+	await harness.emit("session_before_compact", { reason: "threshold" });
+	harness.editor.setText("/reload");
+	harness.editor.handleInput("alt-enter");
+
+	assert.match(renderWidget(harness), /\/reload/);
+	assert.deepEqual(harness.submitted, []);
+	await harness.emit("agent_settled");
+	await waitFor(() => harness.submitted.length === 1);
+	assert.deepEqual(harness.submitted, ["/reload"]);
+});
+
+test("holds automatic-compaction commands through ordinary native input", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	harness.setIdle(true);
+	await harness.emit("session_before_compact", { reason: "threshold" });
+	harness.editor.onSubmit?.("ordinary after automatic compaction");
+	harness.editor.onSubmit?.("/reload");
+
+	await harness.emit("agent_settled");
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.deepEqual(harness.submitted, ["ordinary after automatic compaction"]);
+
+	harness.setIdle(false);
+	await harness.emit("turn_start");
+	harness.setIdle(true);
+	await harness.emit("agent_settled");
+	await waitFor(() => harness.submitted.length === 2);
+	assert.deepEqual(harness.submitted, ["ordinary after automatic compaction", "/reload"]);
+});
+
+test("snapshots rows arriving after reload scheduling at session shutdown", async () => {
+	const first = createHarness();
+	await first.emit("session_start", { reason: "startup" });
+	first.setIdle(true);
+	await enqueue(first, "followUp", "/reload");
+	await enqueue(first, "followUp", "before shutdown");
+	await first.emit("agent_settled");
+	await waitFor(() => first.submitted.length === 1);
+
+	await enqueue(first, "followUp", "arrived after scheduling");
+	await first.emit("session_shutdown", { reason: "reload" });
+
+	const second = createHarness();
+	second.setIdle(true);
+	await second.emit("session_start", { reason: "reload" });
+	await waitFor(() => second.sent.length === 1);
+	assert.equal(second.sent[0]?.content, "before shutdown");
+	await second.emit("agent_settled");
+	assert.equal(second.sent[1]?.content, "arrived after scheduling");
+	assert.match(second.notifications[0]?.message ?? "", /Restored 2 queued rows after reload/);
+	await second.emit("session_shutdown", { reason: "quit" });
+});
+
+test("preserves a paused queue and attachments across direct runtime reload", async () => {
+	const image: ImageContent = { type: "image", data: "AA==", mimeType: "image/png" };
+	const first = createHarness();
+	await first.emit("session_start", { reason: "startup" });
+	await first.emit("input", {
+		source: "interactive",
+		text: "paused image row",
+		images: [image],
+		streamingBehavior: "followUp",
+	});
+	first.editor.handleInput("escape");
+	assert.equal(first.aborted, true);
+	await first.emit("session_shutdown", { reason: "reload" });
+
+	const second = createHarness();
+	second.setIdle(true);
+	await second.emit("session_start", { reason: "reload" });
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.equal(second.sent.length, 0);
+	assert.match(renderWidget(second), /paused/);
+
+	second.editor.handleInput("enter");
+	assert.deepEqual(second.sent[0]?.content, [
+		{ type: "text", text: "paused image row" },
+		image,
+	]);
+	await second.emit("session_shutdown", { reason: "quit" });
+});
+
+test("survives repeated queued reloads without expiry, reordering, or duplication", async () => {
+	const reloadCount = 25;
+	let runtime = createHarness();
+	await runtime.emit("session_start", { reason: "startup" });
+	runtime.setIdle(true);
+	for (let index = 0; index < reloadCount; index += 1) {
+		await enqueue(runtime, "followUp", "/reload");
+	}
+	await enqueue(runtime, "followUp", "after every reload");
+	await runtime.emit("agent_settled");
+
+	for (let index = 0; index < reloadCount; index += 1) {
+		await waitFor(() => runtime.submitted.length === 1);
+		assert.deepEqual(runtime.submitted, ["/reload"]);
+		await runtime.emit("session_shutdown", { reason: "reload" });
+		const replacement = createHarness();
+		replacement.setIdle(true);
+		await replacement.emit("session_start", { reason: "reload" });
+		runtime = replacement;
+	}
+
+	await waitFor(() => runtime.sent.length === 1);
+	assert.deepEqual(runtime.sent.map((item) => item.content), ["after every reload"]);
+	await runtime.emit("session_shutdown", { reason: "quit" });
+});
+
+test("restores the base editor on shutdown so a reloaded runtime cannot retain stale guards", async () => {
+	const harness = createHarness();
+	const baseFactory = harness.editorFactory;
+	await harness.emit("session_start", { reason: "startup" });
+	harness.wrapEditorFactory();
+	await harness.emit("agent_start");
+	await new Promise((resolve) => setTimeout(resolve, 5));
+	assert.notEqual(harness.editorFactory, baseFactory);
+
+	await harness.emit("session_shutdown", { reason: "reload" });
+	assert.equal(harness.editorFactory, baseFactory);
+	harness.editor.onSubmit?.("/reload");
+	assert.deepEqual(harness.submitted, ["/reload"]);
+});
+
+test("cancels a deferred queued reload when another shutdown wins the race", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start", { reason: "startup" });
+	harness.setIdle(true);
+	await enqueue(harness, "followUp", "/reload");
+	await harness.emit("agent_settled");
+	await harness.emit("session_shutdown", { reason: "quit" });
+	await new Promise((resolve) => setTimeout(resolve, 5));
+	assert.deepEqual(harness.submitted, []);
+});
+
+test("expands restored prompt and full Skill rows from the reloaded runtime", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-queue-reload-resources-"));
+	const promptPath = join(dir, "review.md");
+	const skillPath = join(dir, "SKILL.md");
+	writeFileSync(promptPath, "Old prompt $1");
+	writeFileSync(skillPath, "---\nname: bro\ndescription: Plain\n---\nSpeak plainly.");
+	const sourceInfo = (path: string): SlashCommandInfo["sourceInfo"] => ({
+		path,
+		source: "test",
+		scope: "temporary",
+		origin: "top-level",
+	});
+	const commands: SlashCommandInfo[] = [
+		{ name: "review", source: "prompt", sourceInfo: sourceInfo(promptPath) },
+		{ name: "skill:bro", source: "skill", sourceInfo: sourceInfo(skillPath) },
+	];
+	const image: ImageContent = { type: "image", data: "AA==", mimeType: "image/png" };
+	try {
+		const first = createHarness({ commands });
+		await first.emit("session_start", { reason: "startup" });
+		first.setIdle(true);
+		await enqueue(first, "followUp", "/reload");
+		await first.emit("input", {
+			source: "interactive",
+			text: "/review this",
+			images: [image],
+			streamingBehavior: "followUp",
+		});
+		await enqueue(first, "followUp", "/skill:bro simplify");
+		await first.emit("agent_settled");
+		await waitFor(() => first.submitted.length === 1);
+		await first.emit("session_shutdown", { reason: "reload" });
+
+		writeFileSync(promptPath, "Reloaded prompt $1");
+		const second = createHarness({ commands });
+		second.setIdle(true);
+		await second.emit("session_start", { reason: "reload" });
+		await waitFor(() => second.sent.length === 1);
+		assert.deepEqual(second.sent[0]?.content, [
+			{ type: "text", text: "Reloaded prompt this" },
+			image,
+		]);
+		await second.emit("agent_settled");
+		assert.match(String(second.sent[1]?.content), /<skill name="bro"/);
+		assert.match(String(second.sent[1]?.content), /simplify$/);
+		await second.emit("session_shutdown", { reason: "quit" });
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });
