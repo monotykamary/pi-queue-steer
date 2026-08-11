@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Queue plain submissions by default while the agent is stopped: they land in the follow-up lane, paused, instead of starting a run, and `Enter` on the empty composer sends the next row; Pi’s `/…` commands and `!` bash still pass straight through.
+
 - Keep the queue UI in charge while Pi compacts: `Enter`/`Option+Enter` typed during manual, threshold, or overflow compaction land in the editable queue (steering / follow-up) instead of Pi’s private compaction queue, and held dispatch resumes when the window closes — via `session_compact`, the abort signal, a fresh input event, or a staleness cap.
 
 - Add command rows: `/compact [instructions]` and `/reload` queue in FIFO position and execute only once the agent is idle, so rows behind them wait — e.g. a queued `continue` delivers after compaction completes.

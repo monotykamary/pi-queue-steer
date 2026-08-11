@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import queueSteerExtension from "../index.ts";
-import { DeliveryQueue, QueueEditSession, type QueueLane } from "../queue-state.ts";
+import { DeliveryQueue, isQueueableSubmission, QueueEditSession, type QueueLane } from "../queue-state.ts";
 
 test("keeps steering and follow-ups in independent FIFOs", () => {
 	const queue = new DeliveryQueue<string>();
@@ -25,6 +25,17 @@ test("keeps steering and follow-ups in independent FIFOs", () => {
 	);
 	assert.equal(queue.shift("steer")?.text, "steer one");
 	assert.equal(queue.shift("followUp")?.text, "later one");
+});
+
+test("recognises plain submissions as queueable while stopped", () => {
+	assert.equal(isQueueableSubmission("hello"), true);
+	assert.equal(isQueueableSubmission("  spaced idea  "), true);
+	assert.equal(isQueueableSubmission("", [{ type: "image" }]), true);
+	assert.equal(isQueueableSubmission("   "), false);
+	assert.equal(isQueueableSubmission(""), false);
+	assert.equal(isQueueableSubmission("/compact"), false);
+	assert.equal(isQueueableSubmission("/model"), false);
+	assert.equal(isQueueableSubmission("!git status"), false);
 });
 
 test("selects the globally most recent item before navigating spatially", () => {
@@ -164,6 +175,7 @@ function createHarness(options: { cwd?: string; projectTrusted?: boolean } = {})
 	let idle = false;
 	let pending = false;
 	let aborted = false;
+	const compacts: Array<{ customInstructions?: string }> = [];
 	let activeEditor = new MockEditor();
 	let currentFactory: any = () => activeEditor;
 	let widget: unknown;
@@ -206,6 +218,9 @@ function createHarness(options: { cwd?: string; projectTrusted?: boolean } = {})
 		abort() {
 			aborted = true;
 		},
+		compact(options: { customInstructions?: string }) {
+			compacts.push({ customInstructions: options.customInstructions });
+		},
 	};
 
 	const pi = {
@@ -242,6 +257,9 @@ function createHarness(options: { cwd?: string; projectTrusted?: boolean } = {})
 		},
 		get aborted() {
 			return aborted;
+		},
+		get compacts() {
+			return compacts;
 		},
 		setIdle(value: boolean) {
 			idle = value;
@@ -665,6 +683,56 @@ test("promotes a follow-up with steer intent even when isIdle is stale", async (
 		content: "send this now",
 		options: { deliverAs: "steer" },
 	});
+});
+
+test("queues plain submissions while stopped and sends on empty Enter", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	harness.setIdle(true);
+	const image = { type: "image", data: "aW1n", mimeType: "image/png" };
+
+	const [queued] = await harness.emit("input", {
+		source: "interactive",
+		text: "hello when stopped",
+		images: [image],
+	});
+	assert.deepEqual(queued, { action: "handled" });
+	assert.equal(harness.sent.length, 0);
+	const rendered = renderWidget(harness);
+	assert.match(rendered, /follow-ups \(1\) · paused/);
+	assert.match(rendered, /hello when stopped/);
+	assert.match(rendered, /send/);
+
+	harness.editor.handleInput("enter");
+	assert.deepEqual(harness.sent, [
+		{
+			content: [{ type: "text", text: "hello when stopped" }, image],
+			options: { deliverAs: "followUp" },
+		},
+	]);
+});
+
+test("slash commands, bash and non-interactive input still pass through while stopped", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	harness.setIdle(true);
+
+	assert.deepEqual((await harness.emit("input", { source: "interactive", text: "/model" }))[0], { action: "continue" });
+	assert.deepEqual((await harness.emit("input", { source: "interactive", text: "!git status" }))[0], { action: "continue" });
+	assert.deepEqual((await harness.emit("input", { source: "rpc", text: "plain text over rpc" }))[0], { action: "continue" });
+	assert.equal(harness.sent.length, 0);
+	assert.equal(harness.widget, undefined);
+});
+
+test("a queued command row submitted while stopped still runs immediately", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	harness.setIdle(true);
+
+	const [queued] = await harness.emit("input", { source: "interactive", text: "/compact keep the API notes" });
+	assert.deepEqual(queued, { action: "handled" });
+	assert.deepEqual(harness.compacts, [{ customInstructions: "keep the API notes" }]);
+	assert.equal(harness.sent.length, 0);
 });
 
 test("captures Enter into the steering lane during compaction", async () => {

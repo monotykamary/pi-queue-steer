@@ -52,7 +52,8 @@ The extension follows your configured Pi action bindings. These are the default 
 | Editing a row | `Enter` or `Option+Enter` | Save all row edits without changing their lanes |
 | Editing a row | `Escape` | Cancel the session and roll back all unsaved row edits |
 | Empty composer, follow-up queued | `Enter` | Promote the oldest follow-up to steering now |
-| Queue paused after an abort | `Enter` | Resume from the next steering row, or the next follow-up |
+| Agent stopped | `Enter` or `Option+Enter` | Queue the message visibly instead of starting a run |
+| Queue paused (stopped or after an abort) | `Enter` on the empty composer | Send the next steering row, or the next follow-up |
 | Agent working, queue visible | `Escape` | Abort the run and pause both visible lanes |
 
 `Option+Down`, `Option+X` and `Option+T` are the only new fixed shortcuts. The other controls use Pi’s configured action bindings. Terminals outside macOS may label `Option` as `Alt`.
@@ -68,6 +69,12 @@ The extension keeps Pi’s 2 delivery classes:
 - Pi’s `one-at-a-time` and `all` settings apply independently at active-run delivery boundaries
 
 The extension hands messages back to Pi’s native queues only when their delivery boundary arrives. They remain visible and editable before that point. Pi records delivered rows as normal user messages.
+
+## Queueing while stopped
+
+When the agent is stopped, `Enter` and `Option+Enter` place the message into the yellow follow-up box, paused, instead of starting a run. Press `Enter` on the empty composer to send the next row, or `Option+Up` to edit it first.
+
+Pi’s own `/…` commands and `!` bash still run immediately. A `/compact` or `/reload` submitted while stopped also executes at once (see command rows).
 
 ## Command rows
 
@@ -100,7 +107,7 @@ A touched head row is pinned until you save or cancel. In `one-at-a-time` mode, 
 
 Aborting a run pauses both visible lanes. This prevents a follow-up from starting immediately after the abort.
 
-Press `Enter` on the empty composer to resume. A failed handoff returns the affected batch to the front of its lane.
+Press `Enter` on the empty composer to resume; the same keypress sends rows queued while stopped. A failed handoff returns the affected batch to the front of its lane.
 
 While Pi compacts (`/compact` or auto-compaction), submissions still land in the queue and stay editable there: `Enter` queues steering, `Option+Enter` queues a follow-up. Dispatch holds during the window and resumes when compaction ends; cancelling compaction with `Escape` unblocks immediately.
 

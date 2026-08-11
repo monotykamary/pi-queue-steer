@@ -21,6 +21,17 @@ export function parseQueuedCommand(text: string): QueuedCommand | undefined {
 	return undefined;
 }
 
+/**
+ * True when submission content should become a queue row instead of passing
+ * to Pi directly: real text or images, and not Pi's own "/" command or "!"
+ * bash dispatch. Command rows are recognised earlier via parseQueuedCommand.
+ */
+export function isQueueableSubmission(text: string, images?: readonly unknown[]): boolean {
+	const trimmed = text.trim();
+	if (trimmed.startsWith("/") || trimmed.startsWith("!")) return false;
+	return trimmed !== "" || (images?.length ?? 0) > 0;
+}
+
 export interface QueuedMessage<TImage = unknown> {
 	id: string;
 	lane: QueueLane;

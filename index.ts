@@ -13,6 +13,7 @@ import { CompactionWindow } from "./compaction-window.ts";
 import { extractInlineEditorLines } from "./editor-render.ts";
 import {
 	DeliveryQueue,
+	isQueueableSubmission,
 	parseQueuedCommand,
 	QueueEditSession,
 	type QueuedCommand,
@@ -94,6 +95,7 @@ class QueueTimelineWidget implements Component {
 	private readonly editingId: string | undefined;
 	private readonly renderInlineEditor: InlineEditorRenderer | undefined;
 	private readonly paused: boolean;
+	private readonly idle: boolean;
 	private readonly modes: QueueModes;
 	private readonly theme: Theme;
 
@@ -102,6 +104,7 @@ class QueueTimelineWidget implements Component {
 		editingId: string | undefined;
 		renderInlineEditor: InlineEditorRenderer | undefined;
 		paused: boolean;
+		idle: boolean;
 		modes: QueueModes;
 		theme: Theme;
 	}) {
@@ -109,6 +112,7 @@ class QueueTimelineWidget implements Component {
 		this.editingId = options.editingId;
 		this.renderInlineEditor = options.renderInlineEditor;
 		this.paused = options.paused;
+		this.idle = options.idle;
 		this.modes = options.modes;
 		this.theme = options.theme;
 	}
@@ -162,7 +166,9 @@ class QueueTimelineWidget implements Component {
 				? `${dequeue}/${nextRowKeyText()} move · ${REMOVE_ROW_KEY} remove · ${TOGGLE_LANE_KEY} lane · ${submit} save · ${interrupt} cancel`
 				: `${dequeue}/${nextRowKeyText()} move here · ${interrupt} cancel`
 			: this.paused
-				? `${submit} resume · ${dequeue} edit · ${interrupt} keep paused`
+				? this.idle
+					? `${submit} send · ${dequeue} edit`
+					: `${submit} resume · ${dequeue} edit · ${interrupt} keep paused`
 				: lane === "steer"
 					? `${submit} steer/send next · ${dequeue} edit`
 					: `${followUp} add follow-up · ${submit} send next · ${dequeue} edit`;
@@ -325,6 +331,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 				editingId: editSession?.selectedId,
 				renderInlineEditor,
 				paused,
+				idle: ctx.isIdle(),
 				modes: queueModes(),
 				theme,
 			}),
@@ -801,6 +808,16 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 			paused = false;
 			renderQueue(ctx);
 			if (!commandRunning && ctx.isIdle()) dispatchFromIdle(ctx);
+			return { action: "handled" };
+		}
+
+		// Queue by default while the agent is stopped: plain interactive text
+		// or images become a paused follow-up row instead of starting a run.
+		// Enter on the empty composer sends the next row, as after an abort.
+		if (event.streamingBehavior === undefined && ctx.isIdle() && isQueueableSubmission(event.text, event.images)) {
+			queue.enqueue("followUp", event.text, event.images ?? []);
+			paused = true;
+			renderQueue(ctx);
 			return { action: "handled" };
 		}
 
