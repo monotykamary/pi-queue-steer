@@ -685,18 +685,14 @@ test("promotes a follow-up with steer intent even when isIdle is stale", async (
 	});
 });
 
-test("queues plain submissions while stopped and sends on empty Enter", async () => {
+test("queues Option+Enter submissions while stopped and sends on empty Enter", async () => {
 	const harness = createHarness();
 	await harness.emit("session_start");
 	harness.setIdle(true);
-	const image = { type: "image", data: "aW1n", mimeType: "image/png" };
 
-	const [queued] = await harness.emit("input", {
-		source: "interactive",
-		text: "hello when stopped",
-		images: [image],
-	});
-	assert.deepEqual(queued, { action: "handled" });
+	harness.editor.setText("hello when stopped");
+	harness.editor.handleInput("alt-enter");
+	assert.equal(harness.editor.getText(), "");
 	assert.equal(harness.sent.length, 0);
 	const rendered = renderWidget(harness);
 	assert.match(rendered, /follow-ups \(1\) · paused/);
@@ -705,11 +701,28 @@ test("queues plain submissions while stopped and sends on empty Enter", async ()
 
 	harness.editor.handleInput("enter");
 	assert.deepEqual(harness.sent, [
-		{
-			content: [{ type: "text", text: "hello when stopped" }, image],
-			options: { deliverAs: "followUp" },
-		},
+		{ content: "hello when stopped", options: { deliverAs: "followUp" } },
 	]);
+});
+
+test("plain Enter passes straight through while stopped", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	harness.setIdle(true);
+
+	harness.editor.setText("send me now");
+	harness.editor.handleInput("enter");
+	assert.equal(harness.editor.getText(), "send me now");
+	assert.equal(harness.widget, undefined);
+
+	harness.editor.setText("/model");
+	harness.editor.handleInput("alt-enter");
+	assert.equal(harness.editor.getText(), "/model");
+	assert.equal(harness.widget, undefined);
+
+	const [result] = await harness.emit("input", { source: "interactive", text: "send me now" });
+	assert.deepEqual(result, { action: "continue" });
+	assert.equal(harness.sent.length, 0);
 });
 
 test("slash commands, bash and non-interactive input still pass through while stopped", async () => {

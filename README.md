@@ -52,7 +52,7 @@ The extension follows your configured Pi action bindings. These are the default 
 | Editing a row | `Enter` or `Option+Enter` | Save all row edits without changing their lanes |
 | Editing a row | `Escape` | Cancel the session and roll back all unsaved row edits |
 | Empty composer, follow-up queued | `Enter` | Promote the oldest follow-up to steering now |
-| Agent stopped | `Enter` or `Option+Enter` | Queue the message visibly instead of starting a run |
+| Agent stopped | `Option+Enter` | Queue the message visibly; `Enter` keeps Pi's immediate send |
 | Queue paused (stopped or after an abort) | `Enter` on the empty composer | Send the next steering row, or the next follow-up |
 | Agent working, queue visible | `Escape` | Abort the run and pause both visible lanes |
 
@@ -72,7 +72,7 @@ The extension hands messages back to Pi’s native queues only when their delive
 
 ## Queueing while stopped
 
-When the agent is stopped, `Enter` and `Option+Enter` place the message into the yellow follow-up box, paused, instead of starting a run. Press `Enter` on the empty composer to send the next row, or `Option+Up` to edit it first.
+With the agent stopped, `Enter` keeps Pi's normal immediate send. `Option+Enter` instead places the message into the yellow follow-up box, paused. Press `Enter` on the empty composer to send the next queued row, or `Option+Up` to edit it first.
 
 Pi’s own `/…` commands and `!` bash still run immediately. A `/compact` or `/reload` submitted while stopped also executes at once (see command rows).
 

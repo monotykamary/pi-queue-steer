@@ -167,7 +167,7 @@ class QueueTimelineWidget implements Component {
 				: `${dequeue}/${nextRowKeyText()} move here · ${interrupt} cancel`
 			: this.paused
 				? this.idle
-					? `${submit} send · ${dequeue} edit`
+					? `${followUp} queue · ${submit} send · ${dequeue} edit`
 					: `${submit} resume · ${dequeue} edit · ${interrupt} keep paused`
 				: lane === "steer"
 					? `${submit} steer/send next · ${dequeue} edit`
@@ -678,6 +678,22 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 					}
 				}
 
+				if (ctx.isIdle() && keybindings.matches(data, "app.message.followUp")) {
+					// While the agent is stopped, Option+Enter parks the message in the
+					// follow-up lane, paused; plain Enter keeps Pi's immediate send.
+					// Paste images pending in the editor are not readable through the
+					// public editor surface, matching the compaction capture's fidelity.
+					const captureText = editor.getText().trim();
+					if (isQueueableSubmission(captureText)) {
+						queue.enqueue("followUp", captureText, []);
+						paused = true;
+						editor.addToHistory?.(captureText);
+						ctx.ui.setEditorText("");
+						renderQueue(ctx);
+						return;
+					}
+				}
+
 				if (queue.length > 0 && keybindings.matches(data, "app.message.dequeue")) {
 					selectQueueItem(ctx, "previous");
 					return;
@@ -808,16 +824,6 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 			paused = false;
 			renderQueue(ctx);
 			if (!commandRunning && ctx.isIdle()) dispatchFromIdle(ctx);
-			return { action: "handled" };
-		}
-
-		// Queue by default while the agent is stopped: plain interactive text
-		// or images become a paused follow-up row instead of starting a run.
-		// Enter on the empty composer sends the next row, as after an abort.
-		if (event.streamingBehavior === undefined && ctx.isIdle() && isQueueableSubmission(event.text, event.images)) {
-			queue.enqueue("followUp", event.text, event.images ?? []);
-			paused = true;
-			renderQueue(ctx);
 			return { action: "handled" };
 		}
 

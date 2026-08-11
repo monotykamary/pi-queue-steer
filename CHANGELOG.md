@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Queue plain submissions by default while the agent is stopped: they land in the follow-up lane, paused, instead of starting a run, and `Enter` on the empty composer sends the next row; Pi’s `/…` commands and `!` bash still pass straight through.
+- Queue `Option+Enter` submissions while the agent is stopped: they land in the follow-up lane, paused, and an empty-composer `Enter` sends the next row. Plain `Enter` keeps Pi’s immediate send, and `/…` commands or `!` bash pass straight through.
 
 - Keep the queue UI in charge while Pi compacts: `Enter`/`Option+Enter` typed during manual, threshold, or overflow compaction land in the editable queue (steering / follow-up) instead of Pi’s private compaction queue, and held dispatch resumes when the window closes — via `session_compact`, the abort signal, a fresh input event, or a staleness cap.
 
