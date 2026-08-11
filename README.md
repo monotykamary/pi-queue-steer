@@ -21,10 +21,10 @@ Install the latest version from GitHub:
 pi install git:github.com/tmustier/pi-queue-steer
 ```
 
-Pin the first release:
+Pin the current release:
 
 ```bash
-pi install git:github.com/tmustier/pi-queue-steer@v0.1.0
+pi install git:github.com/tmustier/pi-queue-steer@v0.2.0
 ```
 
 Then start a new Pi session or run `/reload`.
@@ -52,8 +52,8 @@ The extension follows your configured Pi action bindings. These are the default 
 | Editing a row | `Enter` or `Option+Enter` | Save all row edits without changing their lanes |
 | Editing a row | `Escape` | Cancel the session and roll back all unsaved row edits |
 | Empty composer, follow-up queued | `Enter` | Promote the oldest follow-up to steering now |
-| Agent stopped | `Option+Enter` | Queue the message visibly; `Enter` keeps Pi's immediate send |
-| Queue paused (stopped or after an abort) | `Enter` on the empty composer | Send the next steering row, or the next follow-up |
+| Queue paused after an abort | `Enter` | Resume from the next steering row, or the next follow-up |
+| Agent stopped | `Option+Enter` | Queue the message visibly, paused; `Enter` keeps Pi’s immediate send |
 | Agent working, queue visible | `Escape` | Abort the run and pause both visible lanes |
 
 `Option+Down`, `Option+X` and `Option+T` are the only new fixed shortcuts. The other controls use Pi’s configured action bindings. Terminals outside macOS may label `Option` as `Alt`.
@@ -68,22 +68,31 @@ The extension keeps Pi’s 2 delivery classes:
 - each lane keeps its own first-in, first-out order
 - Pi’s `one-at-a-time` and `all` settings apply independently at active-run delivery boundaries
 
-The extension hands messages back to Pi’s native queues only when their delivery boundary arrives. They remain visible and editable before that point. Pi records delivered rows as normal user messages.
+The extension hands messages back to Pi’s native queues only when their delivery boundary arrives. They remain visible and editable before that point. Pi records delivered rows as normal user messages. Queue ownership is TUI-only; RPC, JSON and print-mode input pass through unchanged.
 
 ## Queueing while stopped
 
-With the agent stopped, `Enter` keeps Pi's normal immediate send. `Option+Enter` instead places the message into the yellow follow-up box, paused. Press `Enter` on the empty composer to send the next queued row, or `Option+Up` to edit it first.
+With the agent stopped, `Enter` keeps Pi’s normal immediate send. `Option+Enter` instead places the message into the yellow follow-up box, paused. Press `Enter` on the empty composer to send the next queued row, or `Option+Up` to edit it first.
 
-Pi’s own `/…` commands and `!` bash still run immediately. A `/compact` or `/reload` submitted while stopped also executes at once (see command rows).
+Pi’s own `/…` commands and prompt templates still run immediately — a stopped `/compact` or `/reload` executes at once (see command rows) — and `!` bash passes straight to the shell.
+
+## Prompt templates and Agent Skills
+
+Queued `/do-less this code`, `/skill:bro` and `/bro` rows stay short and editable, then expand when delivered. `/bro` is shorthand for `/skill:bro` unless a built-in, prompt or extension already uses that name. Template arguments and images are preserved; unknown slash input remains ordinary text.
+
+Pi cannot invoke arbitrary commands through its public extension API. `/compact` and `/reload` are the supported built-ins. A queued extension command pauses delivery until you edit or remove it.
 
 ## Command rows
 
-Rows whose text is exactly `/compact`, `/compact <instructions>` or `/reload` are command rows. They execute the Pi command instead of becoming an LLM message:
+Text-only rows whose text is exactly `/compact`, `/compact <instructions>` or `/reload` are command rows. A row with image attachments remains a normal message even if its text matches a command, so attachments are never discarded. Command rows execute the Pi command instead of becoming an LLM message:
 
 - `Option+Enter` while the agent works queues the command in follow-up order
 - a command row executes only once the agent is idle; rows behind it wait — so `/compact` followed by `continue` compacts first and delivers `continue` after compaction completes
-- `/reload` runs Pi’s built-in reload; rows queued behind it are restored after the runtime swap
-- `Enter` on `/reload` while the agent works queues it too, replacing Pi’s built-in “wait until the agent finishes” warning; `Enter` on `/compact` keeps Pi’s built-in immediate behaviour
+- `/reload` runs Pi’s built-in reload; committed rows queued behind it retain their IDs, lanes, attachments and pause state across the runtime swap
+- idle `/compact` uses Pi’s public compaction API so queued rows resume when compaction finishes; a start failure restores and pauses the command row
+- `/reload` submitted while the agent works or tracked compaction runs stays queued instead of showing Pi’s built-in wait warning
+- `Enter` on `/compact` while the agent works uses Pi’s public compaction API and holds visible rows until compaction settles
+- ordinary messages submitted during compaction remain in Pi’s native queue and can run before extension-owned command rows after compaction finishes
 - `Option+Enter` on a command while the agent is idle executes it immediately instead of sending the text to the model
 - command rows show a `⚙` marker and pause, resume and edit like any other row; editing a row into or out of command form just works
 
@@ -107,15 +116,17 @@ A touched head row is pinned until you save or cancel. In `one-at-a-time` mode, 
 
 Aborting a run pauses both visible lanes. This prevents a follow-up from starting immediately after the abort.
 
-Press `Enter` on the empty composer to resume; the same keypress sends rows queued while stopped. A failed handoff returns the affected batch to the front of its lane.
+Press `Enter` on the empty composer to resume; the same keypress sends rows queued while stopped. A synchronous handoff or preflight failure returns the affected batch to the front of its lane.
 
-While Pi compacts (`/compact` or auto-compaction), submissions still land in the queue and stay editable there: `Enter` queues steering, `Option+Enter` queues a follow-up. Dispatch holds during the window and resumes when compaction ends; cancelling compaction with `Escape` unblocks immediately.
+Queue state, pause state and edit drafts are session-local. They never enter the Pi transcript or persistent session data. A `/reload` runtime swap carries committed rows and pause state through a short in-process handoff; unsaved edit drafts do not cross the swap.
 
-Queue state, pause state and edit drafts are session-local. They never enter the Pi transcript.
+## Public API limits
 
-## Proof limitation
+Pi’s public `sendUserMessage` API is fire-and-forget. The extension restores synchronous dispatch failures and preflight/expansion failures without reordering, but Pi does not expose later asynchronous input rejection to extensions. Inferring rejection from queue timing could duplicate a delayed successful handoff, so the extension does not do that.
 
-If an `all`-mode lane stays pinned until the agent settles, saving from idle restarts the run with that lane’s head. Pi receives the remaining rows at the next native boundary. Exact single-batch restart after this edge case remains open before release.
+Pi also exposes queued `/reload` only through the TUI editor’s `void` submit callback. The extension prevents known busy and compaction conflicts and restores trailing rows on a successful runtime swap, but Pi cannot acknowledge or reject that submit back to the extension.
+
+If an `all`-mode lane stays pinned until the agent settles, saving from idle starts the new run with the lane head, then delivers the remaining rows in FIFO order at the next native boundary. The public API has no atomic idle-to-native-queue batch operation, so this restart cannot be one native batch.
 
 ## Editor composition
 
@@ -130,12 +141,13 @@ The extension composes with custom editors including raw-paste and pi-session-hu
 ```bash
 npm install
 npm run ci
+./test/tui-evidence.sh /tmp/pi-queue-tui-evidence
 pi -e ./index.ts
 ```
 
-The automated suite covers both lanes, queue modes, delivery boundaries, stable edits, rollback, removal marks, lane toggles, command-row parsing and batch cuts, abort recovery, image preservation, failed handoffs, editor-frame extraction and editor composition. Check TUI changes in a real interactive Pi session as well.
+The automated suite covers delivery, editing, command rows, resource expansion, recovery, images, editor composition, repeated reloads, real retry ordering, real manual compaction success/failure and real automatic overflow compaction. The tmux harness exercises the same paths through Pi's real TUI, including actual runtime reloads and native post-compaction input.
 
-Tested with Pi 0.80.9.
+The Pi package ranges are intentionally unpinned. The full suite and real-TUI harness are verified against the current resolved Pi release; see [the validation record](docs/validation.md) for exact commands and evidence.
 
 ## Security
 

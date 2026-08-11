@@ -22,9 +22,9 @@ export function parseQueuedCommand(text: string): QueuedCommand | undefined {
 }
 
 /**
- * True when submission content should become a queue row instead of passing
- * to Pi directly: real text or images, and not Pi's own "/" command or "!"
- * bash dispatch. Command rows are recognised earlier via parseQueuedCommand.
+ * True when plain submission content should become a queue row instead of
+ * passing to Pi directly: real text or images, and not Pi's own "/" command
+ * or "!" bash dispatch. Command rows are recognised via parseQueuedCommand.
  */
 export function isQueueableSubmission(text: string, images?: readonly unknown[]): boolean {
 	const trimmed = text.trim();
@@ -184,6 +184,25 @@ export class DeliveryQueue<TImage = unknown> {
 
 	get length(): number {
 		return this.items.length;
+	}
+
+	/** Restore an in-memory queue snapshot without changing row identity or recency. */
+	restore(items: readonly QueuedMessage<TImage>[]): void {
+		const ids = new Set<string>();
+		let highestIdNumber = 0;
+		let highestSequence = 0;
+		const restored: QueuedMessage<TImage>[] = [];
+		for (const item of items) {
+			if (ids.has(item.id)) throw new Error(`Duplicate queued row ID: ${item.id}`);
+			ids.add(item.id);
+			const idNumber = /-(\d+)$/.exec(item.id)?.[1];
+			if (idNumber) highestIdNumber = Math.max(highestIdNumber, Number.parseInt(idNumber, 10));
+			highestSequence = Math.max(highestSequence, item.sequence);
+			restored.push(this.copy(item));
+		}
+		this.items = restored;
+		this.nextIdNumber = highestIdNumber + 1;
+		this.nextSequence = highestSequence + 1;
 	}
 
 	clear(): void {
