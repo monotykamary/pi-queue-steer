@@ -375,34 +375,14 @@ test("real public prompt path triggers overflow compaction and preserves a queue
 	}
 });
 
-test("real registered drain command steers queued rows into the active run in timeline order", async () => {
+test("real registered drain command pours queued rows into one steering message", async () => {
 	const harness = await createIntegrationHarness();
 	try {
 		await seedSession(harness);
-		// Record each call's new user texts: Pi natively decides how drained
-		// steering rows group into turns, but the flattened order must match the
-		// visible timeline exactly once each.
-		const callTexts: string[] = [];
-		let recordedUsers = 0;
-		const record = (label: string) => (context: any) => {
-			const users = (context.messages as Array<{ role: string; content: unknown }>)
-				.filter((message) => message.role === "user")
-				.map((message) => typeof message.content === "string"
-					? message.content
-					: (message.content as Array<{ type: string; text?: string }>)
-						.filter((part) => part.type === "text")
-						.map((part) => part.text ?? "")
-						.join("\n"));
-			callTexts.push(...users.slice(recordedUsers));
-			recordedUsers = users.length;
-			return fauxAssistantMessage(label);
-		};
 		const active = gatedResponse("active response");
 		harness.faux.setResponses([
 			active.step,
-			record("after drain one"),
-			record("after drain two"),
-			record("after drain three"),
+			fauxAssistantMessage("after the combined message"),
 		]);
 		const activeStarted = nextAgentStart(harness.session);
 		const activePrompt = harness.session.prompt("active prompt");
@@ -412,18 +392,18 @@ test("real registered drain command steers queued rows into the active run in ti
 		await harness.session.prompt("later two", { streamingBehavior: "followUp" });
 		// Pi executes extension commands immediately, even while streaming.
 		await harness.session.prompt("/queue-drain");
-		const drainedRun = nextAgentRunForUser(harness.session, "later two");
+		const drainedRun = nextAgentRunForUser(harness.session, "steer one\nlater one\nlater two");
 		active.release();
 		await activePrompt;
 
 		await within(drainedRun, () => "drained rows did not settle");
-		assert.deepEqual(userTexts(harness.session).slice(2), [
-			"active prompt",
-			"steer one",
-			"later one",
-			"later two",
-		]);
-		assert.deepEqual(callTexts.slice(2), ["active prompt", "steer one", "later one", "later two"]);
+		// All rows left the queue as one combined user message in the active
+		// run, in timeline order. Depending on how far the in-flight turn had
+		// progressed, Pi delivers it into that call's context or as the next
+		// steering turn; either way the transcript records it exactly once.
+		const texts = userTexts(harness.session);
+		assert.deepEqual(texts.slice(2), ["active prompt", "steer one\nlater one\nlater two"]);
+		assert.equal(texts.filter((text) => text === "steer one\nlater one\nlater two").length, 1);
 		assert.equal(harness.session.getSteeringMessages().length, 0);
 		assert.equal(harness.session.getFollowUpMessages().length, 0);
 	} finally {

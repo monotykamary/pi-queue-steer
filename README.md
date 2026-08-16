@@ -101,13 +101,14 @@ Text-only rows whose text is exactly `/compact`, `/compact <instructions>` or `/
 
 ## Draining the queue
 
-`/queue-drain` empties both lanes into the run at once. Every message row leaves the queue in timeline order — steering rows first, then follow-ups — and is delivered as steering, expanding prompt templates and skills as each row leaves.
+`/queue-drain` empties both lanes into the run as a single combined message. Row texts join in timeline order — steering rows first, then follow-ups — expanding prompt templates and skills as they go, with every row's image attachments appended in the same order.
 
-- during a run, all drained rows reach Pi's native steering queue immediately, regardless of the `one-at-a-time` and `all` mode settings
-- while stopped, the head starts the run and the remaining rows join as steering on the first turn — the earliest moment native steering is accepted
+- during a run, the combined message reaches Pi as one steering message
+- while stopped, the combined message starts a new run directly
+- a mid-turn drain lands inside the in-flight call's context when the turn has not responded yet, or as the next steering turn once it has — either way the transcript records the combined message exactly once
 - command rows are not messages: `/compact` and `/reload` rows stay queued and still execute once the agent is idle
 - an active row-editing session refuses the drain, so rows are never pulled away mid-draft
-- synchronous hand-off failures restore the unsent rows, in order, to the front of their lanes
+- a synchronous hand-off failure restores every row, in order, and pauses the queue
 
 ## Editing semantics
 
@@ -139,7 +140,7 @@ Pi’s public `sendUserMessage` API is fire-and-forget. The extension restores s
 
 Pi also exposes queued `/reload` only through the TUI editor’s `void` submit callback. The extension prevents known busy and compaction conflicts and restores trailing rows on a successful runtime swap, but Pi cannot acknowledge or reject that submit back to the extension.
 
-If an `all`-mode lane stays pinned until the agent settles, saving from idle starts the new run with the lane head, then delivers the remaining rows in FIFO order at the next native boundary. The public API has no atomic idle-to-native-queue batch operation, so this restart cannot be one native batch. A drain from idle follows the same rule: the head starts the run and the remaining rows join as native steering at the first turn.
+If an `all`-mode lane stays pinned until the agent settles, saving from idle starts the new run with the lane head, then delivers the remaining rows in FIFO order at the next native boundary. The public API has no atomic idle-to-native-queue batch operation, so this restart cannot be one native batch. Draining sidesteps that limit by composing its combined message client-side, so one send carries every row.
 
 ## Editor composition
 

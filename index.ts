@@ -238,6 +238,21 @@ function userContent(item: QueuedMessage<ImageContent>): string | (TextContent |
 	return [{ type: "text", text: item.text }, ...item.images];
 }
 
+/**
+ * Combined drain payload: row texts joined in timeline order, with every
+ * row's image attachments appended in the same order.
+ */
+function mergedDrainContent(items: readonly QueuedMessage<ImageContent>[]): string | (TextContent | ImageContent)[] {
+	const text = items
+		.map((item) => item.text)
+		.filter((line) => line !== "")
+		.join("\n")
+		.trim();
+	const images = items.flatMap((item) => item.images);
+	if (images.length === 0) return text;
+	return [{ type: "text", text }, ...images];
+}
+
 function itemCommand(item: Pick<QueuedMessage<ImageContent>, "text" | "images">): QueuedCommand | undefined {
 	// Treat an image-bearing row as a message so executing a command can never
 	// silently discard its attachments.
@@ -254,12 +269,6 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 	let baseEditorFactoryCaptured = false;
 	let reloadSubmitTimer: ReturnType<typeof setTimeout> | undefined;
 	let renderingInline = false;
-	/**
-	 * Message rows drained from idle: the head prompt starts the run, these join
-	 * as steering at the first turn. Pairs keep the original row for restores
-	 * and the reload stash.
-	 */
-	let pendingDrain: { original: QueuedMessage<ImageContent>; prepared: QueuedMessage<ImageContent> }[] = [];
 	let paused = false;
 	let settingsManager: SettingsManager | undefined;
 	let blockingActivity: "compact" | "auto-compact" | "reload" | undefined;
@@ -592,12 +601,10 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 	};
 
 	/**
-	 * Explicit flush of every queued message row in timeline order, delivered as
-	 * steering so both lanes empty into the run at once. Command rows are not
-	 * messages: they stay queued to execute when the agent is idle. From idle,
-	 * the head starts the run through the public prompt path and the remaining
-	 * rows join as steering on the first turn — the earliest moment Pi accepts
-	 * native steering without prompting each row into its own immediate run.
+	 * Explicit flush: compose every queued message row into one message in
+	 * timeline order and send it at once — as native steering during a run, or
+	 * as the prompt that starts the run from idle. Command rows are not
+	 * messages: they stay queued to execute when the agent is idle.
 	 */
 	const drainAll = (ctx: ExtensionContext): void => {
 		activeContext = ctx;
@@ -619,13 +626,10 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 			);
 			return;
 		}
-		let pairs: typeof pendingDrain;
+		let prepared: QueuedMessage<ImageContent>[];
 		try {
 			const commands = pi.getCommands();
-			pairs = messages.map((original) => ({
-				original,
-				prepared: { ...original, text: expandQueuedInput(original.text, commands) },
-			}));
+			prepared = messages.map((item) => ({ ...item, text: expandQueuedInput(item.text, commands) }));
 		} catch (error) {
 			paused = true;
 			renderQueue(ctx);
@@ -642,73 +646,26 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 			: "";
 		paused = false;
 
-		if (ctx.isIdle()) {
-			const [head, ...rest] = pairs;
-			try {
-				pi.sendUserMessage(userContent(head.prepared));
-			} catch (error) {
-				queue.prependMany(pairs.map((pair) => pair.original));
-				paused = true;
-				renderQueue(ctx);
-				ctx.ui.notify(
-					`Could not drain the queue: ${error instanceof Error ? error.message : String(error)}`,
-					"error",
-				);
-				return;
-			}
-			pendingDrain = rest;
-			renderQueue(ctx);
-			ctx.ui.notify(
-				rest.length === 0
-					? `Sent the queued message to start the run${commandNote}`
-					: `Started the run with the queue head; ${rest.length} more row${rest.length === 1 ? "" : "s"} steer in on the first turn${commandNote}`,
-				"info",
-			);
-			return;
-		}
-
-		let delivered = 0;
+		const idle = ctx.isIdle();
 		try {
-			for (const pair of pairs) {
-				pi.sendUserMessage(userContent(pair.prepared), { deliverAs: "steer" });
-				delivered += 1;
-			}
+			pi.sendUserMessage(mergedDrainContent(prepared), idle ? undefined : { deliverAs: "steer" });
 		} catch (error) {
-			queue.prependMany(pairs.slice(delivered).map((pair) => pair.original));
+			queue.prependMany(messages);
+			paused = true;
 			renderQueue(ctx);
 			ctx.ui.notify(
-				`Could not drain the queue: ${error instanceof Error ? error.message : String(error)}; restored the unsent rows`,
+				`Could not drain the queue: ${error instanceof Error ? error.message : String(error)}; restored every row`,
 				"error",
 			);
 			return;
 		}
 		renderQueue(ctx);
 		ctx.ui.notify(
-			`Drained ${pairs.length} queued message${pairs.length === 1 ? "" : "s"} as steering${commandNote}`,
+			idle
+				? `Drained ${prepared.length} queued message${prepared.length === 1 ? "" : "s"} into one message${commandNote}`
+				: `Drained ${prepared.length} queued message${prepared.length === 1 ? "" : "s"} into one steering message${commandNote}`,
 			"info",
 		);
-	};
-
-	/** Deliver idle-drained rows once the head run's first turn accepts native steering. */
-	const flushPendingDrain = (ctx: ExtensionContext): void => {
-		if (pendingDrain.length === 0 || isCompacting()) return;
-		const drained = pendingDrain;
-		pendingDrain = [];
-		let delivered = 0;
-		try {
-			for (const pair of drained) {
-				pi.sendUserMessage(userContent(pair.prepared), { deliverAs: "steer" });
-				delivered += 1;
-			}
-		} catch (error) {
-			queue.prependMany(drained.slice(delivered).map((pair) => pair.original));
-			paused = true;
-			ctx.ui.notify(
-				`Could not steer drained rows: ${error instanceof Error ? error.message : String(error)}; queue paused`,
-				"error",
-			);
-		}
-		renderQueue(ctx);
 	};
 
 	const finishEditing = (
@@ -1037,7 +994,6 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 	pi.on("turn_start", (_event, ctx) => {
 		activeContext = ctx;
 		if (isCompacting() && nativeCompactionInputQueued) nativeCompactionTurnStarted = true;
-		flushPendingDrain(ctx);
 	});
 
 	pi.on("turn_end", async (event, ctx) => {
@@ -1095,9 +1051,8 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", (event) => {
-		const stashRows = [...queue.snapshot(), ...pendingDrain.map((pair) => pair.original)];
-		if (event.reason === "reload" && stashRows.length > 0) {
-			const stash: ReloadStash = { paused, rows: stashRows };
+		if (event.reason === "reload" && queue.length > 0) {
+			const stash: ReloadStash = { paused, rows: queue.snapshot() };
 			globalThis.__tmustierPiQueueSteerReloadStash = stash;
 		} else {
 			globalThis.__tmustierPiQueueSteerReloadStash = undefined;
@@ -1125,7 +1080,6 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		compactionFinishTimer = undefined;
 		editSession = undefined;
 		settingsManager = undefined;
-		pendingDrain = [];
 		paused = false;
 		blockingActivity = undefined;
 		nativeCompactionInputQueued = false;

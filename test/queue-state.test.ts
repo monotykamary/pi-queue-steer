@@ -1471,22 +1471,20 @@ test("drain command steers every queued message into a live run in timeline orde
 	await enqueue(harness, "followUp", "later two");
 
 	await harness.runCommand("queue-drain");
-	assert.deepEqual(harness.sent.map((item) => [item.content, item.options]), [
-		["steer one", { deliverAs: "steer" }],
-		["steer two", { deliverAs: "steer" }],
-		["later one", { deliverAs: "steer" }],
-		["later two", { deliverAs: "steer" }],
-	]);
+	assert.deepEqual(harness.sent, [{
+		content: "steer one\nsteer two\nlater one\nlater two",
+		options: { deliverAs: "steer" },
+	}]);
 	const rendered = renderWidget(harness);
 	assert.match(rendered, /\/compact keep this row/);
 	assert.doesNotMatch(rendered, /steer one|later one/);
 	assert.match(
 		harness.notifications.at(-1)?.message ?? "",
-		/Drained 4 queued messages as steering; 1 command row stays queued/,
+		/Drained 4 queued messages into one steering message; 1 command row stays queued/,
 	);
 });
 
-test("drain from idle starts the run with the head and steers the rest at turn start", async () => {
+test("drain from idle pours every row into a single message that starts the run", async () => {
 	const harness = createHarness();
 	await harness.emit("session_start");
 	harness.setIdle(true);
@@ -1497,17 +1495,9 @@ test("drain from idle starts the run with the head and steers the rest at turn s
 	assert.match(renderWidget(harness), /follow-ups \(3\) · paused/);
 
 	await harness.runCommand("queue-drain");
-	assert.deepEqual(harness.sent, [{ content: "one", options: undefined }]);
+	assert.deepEqual(harness.sent, [{ content: "one\ntwo\nthree", options: undefined }]);
 	assert.equal(harness.widget, undefined);
-	assert.match(harness.notifications.at(-1)?.message ?? "", /queue head; 2 more rows steer in/);
-
-	harness.setIdle(false);
-	await harness.emit("turn_start");
-	assert.deepEqual(harness.sent.map((item) => [item.content, item.options]), [
-		["one", undefined],
-		["two", { deliverAs: "steer" }],
-		["three", { deliverAs: "steer" }],
-	]);
+	assert.match(harness.notifications.at(-1)?.message ?? "", /Drained 3 queued messages into one message/);
 });
 
 test("drain refuses to pull rows from an active editing session", async () => {
@@ -1535,25 +1525,45 @@ test("drain reports an empty queue and keeps command-only rows in place", async 
 	assert.match(renderWidget(harness), /\/compact later/);
 });
 
-test("a send failure during the drain flush restores and pauses the unsent tail", async () => {
-	const harness = createHarness({ sendFailureAt: 2 });
+test("a drain merges attachments from every row into the combined message", async () => {
+	const image: ImageContent = { type: "image", data: "AA==", mimeType: "image/png" };
+	const harness = createHarness();
+	await harness.emit("session_start");
+	await harness.emit("input", {
+		source: "interactive",
+		text: "look at this",
+		images: [image],
+		streamingBehavior: "steer",
+	});
+	await enqueue(harness, "followUp", "then continue");
+
+	await harness.runCommand("queue-drain");
+	assert.deepEqual(harness.sent, [{
+		content: [{ type: "text", text: "look at this\nthen continue" }, image],
+		options: { deliverAs: "steer" },
+	}]);
+});
+
+test("a send failure during a drain restores every row and pauses", async () => {
+	const harness = createHarness({ sendFailureAt: 1 });
 	await harness.emit("session_start");
 	harness.setIdle(true);
 	for (const text of ["one", "two", "three"]) {
 		harness.editor.setText(text);
 		harness.editor.handleInput("alt-enter");
 	}
-	await harness.runCommand("queue-drain");
-	assert.deepEqual(harness.sent, [{ content: "one", options: undefined }]);
 
-	harness.setIdle(false);
-	await harness.emit("turn_start");
-	assert.deepEqual(harness.sent, [{ content: "one", options: undefined }]);
+	await harness.runCommand("queue-drain");
+	assert.equal(harness.sent.length, 0);
 	const rendered = renderWidget(harness);
+	assert.match(rendered, /one/);
 	assert.match(rendered, /two/);
 	assert.match(rendered, /three/);
 	assert.match(rendered, /paused/);
-	assert.match(harness.notifications.at(-1)?.message ?? "", /Could not steer drained rows/);
+	assert.match(
+		harness.notifications.at(-1)?.message ?? "",
+		/Could not drain the queue.*restored every row/,
+	);
 });
 
 
@@ -1581,23 +1591,4 @@ test("a drain with an unpreparable row keeps every row queued and pauses", async
 	);
 });
 
-test("a reload carries drained rows that have not reached the first turn", async () => {
-	const first = createHarness();
-	await first.emit("session_start", { reason: "startup" });
-	first.setIdle(true);
-	for (const text of ["one", "two"]) {
-		first.editor.setText(text);
-		first.editor.handleInput("alt-enter");
-	}
-	await first.runCommand("queue-drain");
-	assert.deepEqual(first.sent, [{ content: "one", options: undefined }]);
-	await first.emit("session_shutdown", { reason: "reload" });
-
-	const second = createHarness();
-	second.setIdle(true);
-	await second.emit("session_start", { reason: "reload" });
-	await waitFor(() => second.sent.length === 1);
-	assert.equal(second.sent[0]?.content, "two");
-	await second.emit("session_shutdown", { reason: "quit" });
-});
 
