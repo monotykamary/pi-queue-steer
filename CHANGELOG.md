@@ -4,6 +4,7 @@
 
 ### Added
 
+- Reorder the selected row within its lane while editing with `Option+Shift+Up` and `Option+Shift+Down`. Positions keep stable row IDs and attachments, apply to dispatch order immediately and roll back with the rest of the editing session on `Escape`.
 - Queue `Option+Enter` submissions while the agent is stopped: they land in the follow-up lane, paused, and an empty-composer `Enter` sends the next row. Plain `Enter` keeps Pi’s immediate send, and slash commands, prompt templates and `!` bash pass straight through.
 
 ## 0.2.0 - 2026-08-09

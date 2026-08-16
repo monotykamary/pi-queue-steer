@@ -156,6 +156,44 @@ test("toggling a lane twice leaves the row untouched at commit", () => {
 	assert.deepEqual(queue.laneSnapshot("steer").map((item) => item.text), ["first", "second"]);
 });
 
+test("swaps a row with its lane neighbour without touching the other lane", () => {
+	const queue = new DeliveryQueue();
+	const firstSteer = queue.enqueue("steer", "steer one");
+	const followUp = queue.enqueue("followUp", "later one");
+	const secondSteer = queue.enqueue("steer", "steer two");
+
+	assert.equal(queue.moveInLane(secondSteer.id, -1), true);
+	assert.deepEqual(queue.laneSnapshot("steer").map((item) => item.id), [secondSteer.id, firstSteer.id]);
+	assert.deepEqual(queue.laneSnapshot("followUp").map((item) => item.id), [followUp.id]);
+	assert.equal(queue.get(secondSteer.id)?.lane, "steer");
+	assert.equal(queue.get(secondSteer.id)?.sequence, secondSteer.sequence);
+});
+
+test("reorders refuse lane ends and unknown rows", () => {
+	const queue = new DeliveryQueue();
+	const only = queue.enqueue("steer", "only");
+	assert.equal(queue.moveInLane(only.id, -1), false);
+	assert.equal(queue.moveInLane(only.id, 1), false);
+	assert.equal(queue.moveInLane("missing-9", -1), false);
+	assert.deepEqual(queue.laneSnapshot("steer").map((item) => item.id), [only.id]);
+});
+
+test("session reorders roll back in reverse and keep row identity", () => {
+	const queue = new DeliveryQueue();
+	const first = queue.enqueue("steer", "first");
+	const second = queue.enqueue("steer", "second");
+	const third = queue.enqueue("steer", "third");
+
+	const edit = new QueueEditSession(third, "");
+	assert.equal(edit.moveRow(queue, third.id, -1), true);
+	assert.equal(edit.moveRow(queue, third.id, -1), true);
+	assert.deepEqual(queue.laneSnapshot("steer").map((item) => item.id), [third.id, first.id, second.id]);
+
+	edit.rollbackPositions(queue);
+	assert.deepEqual(queue.laneSnapshot("steer").map((item) => item.id), [first.id, second.id, third.id]);
+	assert.equal(queue.get(third.id)?.text, "third");
+});
+
 class MockEditor {
 	private text = "";
 	private autocompleteVisible = false;
@@ -801,6 +839,68 @@ test("Escape rolls back a lane toggle with the rest of the session", async () =>
 	assert.equal(harness.sent.length, 0);
 	await harness.emit("agent_end");
 	assert.deepEqual(harness.sent[0], { content: "stay a follow-up", options: { deliverAs: "followUp" } });
+});
+
+test("Alt+Shift+Up reorders the selected row on screen and at dispatch", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	await enqueue(harness, "steer", "first");
+	await enqueue(harness, "steer", "second");
+
+	harness.editor.handleInput("alt-up");
+	harness.editor.setText("second edited");
+	harness.editor.handleInput("\x1b[1;4A");
+	const preview = renderWidget(harness);
+	assert.ok(preview.indexOf("second edited") < preview.indexOf("first"));
+	assert.equal(harness.editor.getText(), "second edited");
+
+	// The reordered row is now the lane head and pins dispatch until saved.
+	await harness.emit("turn_end", { message: { role: "assistant", stopReason: "toolUse" } });
+	assert.equal(harness.sent.length, 0);
+
+	harness.editor.handleInput("enter");
+	await harness.emit("turn_end", { message: { role: "assistant", stopReason: "toolUse" } });
+	await harness.emit("turn_end", { message: { role: "assistant", stopReason: "toolUse" } });
+	assert.deepEqual(harness.sent.map((item) => [item.content, item.options]), [
+		["second edited", { deliverAs: "steer" }],
+		["first", { deliverAs: "steer" }],
+	]);
+});
+
+test("Escape restores the original lane order after an in-session reorder", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	await enqueue(harness, "steer", "first");
+	await enqueue(harness, "steer", "second");
+
+	harness.editor.handleInput("alt-up");
+	harness.editor.handleInput("\x1b[1;4A");
+	harness.editor.handleInput("escape");
+
+	const restored = renderWidget(harness);
+	assert.ok(restored.indexOf("first") < restored.indexOf("second"));
+	await harness.emit("turn_end", { message: { role: "assistant", stopReason: "toolUse" } });
+	assert.deepEqual(harness.sent[0], { content: "first", options: { deliverAs: "steer" } });
+});
+
+test("a pending lane toggle freezes reorder until undone or saved", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	await enqueue(harness, "steer", "steer one");
+	await enqueue(harness, "followUp", "promote me");
+
+	harness.editor.handleInput("alt-up");
+	harness.editor.handleInput("\x1bt");
+	harness.editor.handleInput("\x1b[1;4A");
+	assert.match(harness.notifications.at(-1)?.message ?? "", /before reordering/);
+
+	harness.editor.handleInput("enter");
+	await harness.emit("turn_end", { message: { role: "assistant", stopReason: "toolUse" } });
+	await harness.emit("turn_end", { message: { role: "assistant", stopReason: "toolUse" } });
+	assert.deepEqual(harness.sent.map((item) => [item.content, item.options]), [
+		["steer one", { deliverAs: "steer" }],
+		["promote me", { deliverAs: "steer" }],
+	]);
 });
 
 test("navigation follows the visual timeline while a lane draft is active", async () => {

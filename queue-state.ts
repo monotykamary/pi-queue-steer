@@ -86,6 +86,28 @@ export class DeliveryQueue<TImage = unknown> {
 		return true;
 	}
 
+	/** Swap a row with its lane neighbour in delivery order. Returns false at lane ends. */
+	moveInLane(id: string, direction: -1 | 1): boolean {
+		const item = this.items.find((candidate) => candidate.id === id);
+		if (!item) return false;
+		const laneIndexes: number[] = [];
+		let fromSlot = -1;
+		for (const [index, candidate] of this.items.entries()) {
+			if (candidate.lane !== item.lane) continue;
+			if (candidate.id === id) fromSlot = laneIndexes.length;
+			laneIndexes.push(index);
+		}
+		const fromIndex = laneIndexes[fromSlot];
+		const toIndex = laneIndexes[fromSlot + direction];
+		if (fromIndex === undefined || toIndex === undefined) return false;
+		const moved = this.items[fromIndex];
+		const neighbour = this.items[toIndex];
+		if (!moved || !neighbour) return false;
+		this.items[fromIndex] = neighbour;
+		this.items[toIndex] = moved;
+		return true;
+	}
+
 	/** Reclassify a row into the other lane, joining that lane's tail. */
 	moveToLaneTail(id: string, lane: QueueLane): boolean {
 		const index = this.items.findIndex((item) => item.id === id);
@@ -231,6 +253,7 @@ export interface EditCommitResult {
 /** Rollback-safe drafts spanning rows from either delivery lane. */
 export class QueueEditSession<TImage = unknown> {
 	private readonly drafts = new Map<string, QueuedMessageDraft<TImage>>();
+	private readonly positionMoves: { id: string; direction: -1 | 1 }[] = [];
 	private currentId: string;
 	readonly composerDraft: string;
 
@@ -266,6 +289,26 @@ export class QueueEditSession<TImage = unknown> {
 		}
 		this.currentId = item.id;
 		return this.selectedText;
+	}
+
+	/**
+	 * Move a row within its lane immediately, recording the inverse so cancel
+	 * restores positions. Position changes apply to dispatch order at once;
+	 * Escape replays the inverses newest-first.
+	 */
+	moveRow(queue: DeliveryQueue<TImage>, id: string, direction: -1 | 1): boolean {
+		if (!queue.moveInLane(id, direction)) return false;
+		this.positionMoves.push({ id, direction });
+		return true;
+	}
+
+	/** Undo in-session reorders, newest first. Best-effort if rows left mid-session. */
+	rollbackPositions(queue: DeliveryQueue<TImage>): void {
+		for (let index = this.positionMoves.length - 1; index >= 0; index -= 1) {
+			const move = this.positionMoves[index];
+			if (move) queue.moveInLane(move.id, move.direction === 1 ? -1 : 1);
+		}
+		this.positionMoves.length = 0;
 	}
 
 	/** Toggle whether the row is deleted on save. Returns the new mark. */

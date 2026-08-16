@@ -38,6 +38,8 @@ declare global {
 }
 const REMOVE_ROW_KEY = "alt+x";
 const TOGGLE_LANE_KEY = "alt+t";
+const REORDER_UP_KEY = "alt+shift+up";
+const REORDER_DOWN_KEY = "alt+shift+down";
 
 type QueueMode = "all" | "one-at-a-time";
 type EditorFactory = NonNullable<ReturnType<ExtensionContext["ui"]["getEditorComponent"]>>;
@@ -158,7 +160,7 @@ class QueueTimelineWidget implements Component {
 		const selectedHere = items.some((item) => item.id === this.editingId);
 		const help = this.editingId
 			? selectedHere
-				? `${dequeue}/${nextRowKeyText()} move · ${REMOVE_ROW_KEY} remove · ${TOGGLE_LANE_KEY} lane · ${submit} save · ${interrupt} cancel`
+				? `${dequeue}/${nextRowKeyText()} move · ${REORDER_UP_KEY}/${REORDER_DOWN_KEY} reorder · ${REMOVE_ROW_KEY} remove · ${TOGGLE_LANE_KEY} lane · ${submit} save · ${interrupt} cancel`
 				: `${dequeue}/${nextRowKeyText()} move here · ${interrupt} cancel`
 			: this.paused
 				? this.idle
@@ -290,6 +292,26 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		if (mode === "all") return editSession.touchesLane(queue, lane);
 		const head = queue.peek(lane);
 		return !!head && editSession.touches(head.id);
+	};
+
+	/**
+	 * Reorder the selected row within its committed lane. Position changes
+	 * apply to dispatch order at once; the session records inverses so Escape
+	 * restores positions. A pending lane toggle freezes position until saved
+	 * or undone, since the row previews in a lane it has not physically
+	 * joined.
+	 */
+	const reorderSelectedRow = (ctx: ExtensionContext, direction: -1 | 1): void => {
+		const session = editSession;
+		if (!session) return;
+		const item = queue.get(session.selectedId);
+		if (!item) return;
+		const draftLane = session.laneFor(item.id);
+		if (draftLane && draftLane !== item.lane) {
+			ctx.ui.notify(`Undo the pending lane move (${TOGGLE_LANE_KEY}) before reordering this row`, "info");
+			return;
+		}
+		if (session.moveRow(queue, item.id, direction)) renderQueue(ctx);
 	};
 
 	/**
@@ -570,6 +592,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 	): void => {
 		const session = editSession;
 		if (!session) return;
+		if (!save) session.rollbackPositions(queue);
 		const result = save ? session.commit(queue, text, images) : undefined;
 
 		editSession = undefined;
@@ -675,6 +698,10 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 					if (matchesKey(data, TOGGLE_LANE_KEY)) {
 						editSession.toggleLane(editSession.selectedId);
 						renderQueue(ctx);
+						return;
+					}
+					if (matchesKey(data, REORDER_UP_KEY) || matchesKey(data, REORDER_DOWN_KEY)) {
+						reorderSelectedRow(ctx, matchesKey(data, REORDER_UP_KEY) ? -1 : 1);
 						return;
 					}
 					if (keybindings.matches(data, "app.interrupt") && !isShowingAutocomplete()) {

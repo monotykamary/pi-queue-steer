@@ -49,6 +49,7 @@ The extension follows your configured Pi action bindings. These are the default 
 | Editing a row | Type normally | Edit directly inside the selected row |
 | Editing a row | `Option+X` | Mark the selected row for removal; save deletes it, a second press restores it |
 | Editing a row | `Option+T` | Move the selected row to the other lane when saved |
+| Editing a row | `Option+Shift+Up` / `Option+Shift+Down` | Reorder the selected row within its lane; positions apply immediately and roll back on `Escape` |
 | Editing a row | `Enter` or `Option+Enter` | Save all row edits without changing their lanes |
 | Editing a row | `Escape` | Cancel the session and roll back all unsaved row edits |
 | Empty composer, follow-up queued | `Enter` | Promote the oldest follow-up to steering now |
@@ -56,7 +57,7 @@ The extension follows your configured Pi action bindings. These are the default 
 | Agent stopped | `Option+Enter` | Queue the message visibly, paused; `Enter` keeps Pi’s immediate send |
 | Agent working, queue visible | `Escape` | Abort the run and pause both visible lanes |
 
-`Option+Down`, `Option+X` and `Option+T` are the only new fixed shortcuts. The other controls use Pi’s configured action bindings. Terminals outside macOS may label `Option` as `Alt`.
+`Option+Down`, `Option+X`, `Option+T` and `Option+Shift+Up/Down` are the only new fixed shortcuts. The other controls use Pi’s configured action bindings. Terminals outside macOS may label `Option` as `Alt`.
 
 ## Delivery semantics
 
@@ -66,6 +67,8 @@ The extension keeps Pi’s 2 delivery classes:
 - follow-ups wait until the run finishes
 - the blue steering box remains above the yellow follow-up box
 - each lane keeps its own first-in, first-out order
+- reordered rows keep their stable IDs, text drafts and attachments
+- reordering waits while a lane toggle is pending; the lane move lands first on save
 - Pi’s `one-at-a-time` and `all` settings apply independently at active-run delivery boundaries
 
 The extension hands messages back to Pi’s native queues only when their delivery boundary arrives. They remain visible and editable before that point. Pi records delivered rows as normal user messages. Queue ownership is TUI-only; RPC, JSON and print-mode input pass through unchanged.
