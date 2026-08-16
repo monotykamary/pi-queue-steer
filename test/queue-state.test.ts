@@ -246,6 +246,7 @@ function createHarness(options: {
 } = {}) {
 	type Handler = (event: any, context: any) => any;
 	const handlers = new Map<string, Handler[]>();
+	const registeredCommands = new Map<string, { description?: string; handler: (args: string, context: any) => Promise<void> }>();
 	const sent: Array<{ content: unknown; options: any }> = [];
 	const submitted: string[] = [];
 	const compactCalls: CompactOptions[] = [];
@@ -323,6 +324,9 @@ function createHarness(options: {
 			if (sendOptions) pending = true;
 		},
 		getCommands: () => options.commands ?? [],
+		registerCommand(name: string, commandOptions: { description?: string; handler: (args: string, context: any) => Promise<void> }) {
+			registeredCommands.set(name, commandOptions);
+		},
 	};
 
 	queueSteerExtension(pi as any);
@@ -344,6 +348,11 @@ function createHarness(options: {
 		submitted,
 		compactCalls,
 		notifications,
+		async runCommand(name: string, args = "") {
+			const command = registeredCommands.get(name);
+			assert.ok(command, `expected /${name} to be registered`);
+			await command.handler(args, context);
+		},
 		get editor() {
 			return activeEditor;
 		},
@@ -1380,3 +1389,215 @@ test("plain Enter, slash text and bash pass straight through while stopped", asy
 	assert.equal(harness.editor.getText(), "!git status");
 	assert.equal(harness.widget, undefined);
 });
+
+test("queues stopped Option+Enter skill and template commands, autoexpanding each when reached", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-queue-stopped-resources-"));
+	const promptPath = join(dir, "do-less.md");
+	const skillPath = join(dir, "SKILL.md");
+	writeFileSync(promptPath, "Simplify $@");
+	writeFileSync(skillPath, "---\nname: bro\ndescription: Speak plainly\n---\nSpeak plainly.");
+	const sourceInfo = (path: string): SlashCommandInfo["sourceInfo"] => ({
+		path,
+		source: "test",
+		scope: "temporary",
+		origin: "top-level",
+	});
+	const harness = createHarness({
+		commands: [
+			{ name: "do-less", source: "prompt", sourceInfo: sourceInfo(promptPath) },
+			{ name: "skill:bro", source: "skill", sourceInfo: sourceInfo(skillPath) },
+		],
+	});
+	try {
+		await harness.emit("session_start");
+		harness.setIdle(true);
+
+		harness.editor.setText("/bro this paragraph");
+		harness.editor.handleInput("alt-enter");
+		harness.editor.setText("/do-less the parser");
+		harness.editor.handleInput("alt-enter");
+		assert.equal(harness.sent.length, 0);
+		const parked = renderWidget(harness);
+		assert.match(parked, /follow-ups \(2\) · paused/);
+		assert.match(parked, /\/bro this paragraph/);
+		assert.match(parked, /\/do-less the parser/);
+
+		harness.editor.handleInput("enter");
+		assert.equal(harness.sent.length, 1);
+		assert.match(String(harness.sent[0]?.content), /<skill name="bro"/);
+		assert.match(String(harness.sent[0]?.content), /Speak plainly\./);
+		assert.match(String(harness.sent[0]?.content), /this paragraph$/);
+		assert.equal(harness.sent[0]?.options, undefined);
+
+		harness.editor.handleInput("enter");
+		assert.equal(harness.sent.length, 2);
+		assert.equal(harness.sent[1]?.content, "Simplify the parser");
+		assert.equal(harness.sent[1]?.options, undefined);
+		assert.equal(harness.widget, undefined);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("extension and unknown slash commands still pass straight through while stopped", async () => {
+	const harness = createHarness({
+		commands: [{
+			name: "deploy",
+			source: "extension",
+			sourceInfo: { path: "/deploy.ts", source: "test", scope: "temporary", origin: "top-level" },
+		}],
+	});
+	await harness.emit("session_start");
+	harness.setIdle(true);
+
+	harness.editor.setText("/deploy prod");
+	harness.editor.handleInput("alt-enter");
+	assert.equal(harness.editor.getText(), "/deploy prod");
+	assert.equal(harness.widget, undefined);
+
+	harness.editor.setText("/not-a-command at all");
+	harness.editor.handleInput("alt-enter");
+	assert.equal(harness.editor.getText(), "/not-a-command at all");
+	assert.equal(harness.widget, undefined);
+});
+
+test("drain command steers every queued message into a live run in timeline order", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	await enqueue(harness, "followUp", "later one");
+	await enqueue(harness, "steer", "steer one");
+	await enqueue(harness, "followUp", "/compact keep this row");
+	await enqueue(harness, "steer", "steer two");
+	await enqueue(harness, "followUp", "later two");
+
+	await harness.runCommand("queue-drain");
+	assert.deepEqual(harness.sent.map((item) => [item.content, item.options]), [
+		["steer one", { deliverAs: "steer" }],
+		["steer two", { deliverAs: "steer" }],
+		["later one", { deliverAs: "steer" }],
+		["later two", { deliverAs: "steer" }],
+	]);
+	const rendered = renderWidget(harness);
+	assert.match(rendered, /\/compact keep this row/);
+	assert.doesNotMatch(rendered, /steer one|later one/);
+	assert.match(
+		harness.notifications.at(-1)?.message ?? "",
+		/Drained 4 queued messages as steering; 1 command row stays queued/,
+	);
+});
+
+test("drain from idle starts the run with the head and steers the rest at turn start", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	harness.setIdle(true);
+	for (const text of ["one", "two", "three"]) {
+		harness.editor.setText(text);
+		harness.editor.handleInput("alt-enter");
+	}
+	assert.match(renderWidget(harness), /follow-ups \(3\) · paused/);
+
+	await harness.runCommand("queue-drain");
+	assert.deepEqual(harness.sent, [{ content: "one", options: undefined }]);
+	assert.equal(harness.widget, undefined);
+	assert.match(harness.notifications.at(-1)?.message ?? "", /queue head; 2 more rows steer in/);
+
+	harness.setIdle(false);
+	await harness.emit("turn_start");
+	assert.deepEqual(harness.sent.map((item) => [item.content, item.options]), [
+		["one", undefined],
+		["two", { deliverAs: "steer" }],
+		["three", { deliverAs: "steer" }],
+	]);
+});
+
+test("drain refuses to pull rows from an active editing session", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	await enqueue(harness, "steer", "under edit");
+	harness.editor.handleInput("alt-up");
+
+	await harness.runCommand("queue-drain");
+	assert.equal(harness.sent.length, 0);
+	assert.match(harness.notifications.at(-1)?.message ?? "", /Finish or cancel row editing/);
+	assert.match(renderWidget(harness), /under edit/);
+});
+
+test("drain reports an empty queue and keeps command-only rows in place", async () => {
+	const harness = createHarness();
+	await harness.emit("session_start");
+	await harness.runCommand("queue-drain");
+	assert.match(harness.notifications.at(-1)?.message ?? "", /Queue is empty/);
+
+	await enqueue(harness, "followUp", "/compact later");
+	await harness.runCommand("queue-drain");
+	assert.match(harness.notifications.at(-1)?.message ?? "", /No queued messages to drain/);
+	assert.equal(harness.sent.length, 0);
+	assert.match(renderWidget(harness), /\/compact later/);
+});
+
+test("a send failure during the drain flush restores and pauses the unsent tail", async () => {
+	const harness = createHarness({ sendFailureAt: 2 });
+	await harness.emit("session_start");
+	harness.setIdle(true);
+	for (const text of ["one", "two", "three"]) {
+		harness.editor.setText(text);
+		harness.editor.handleInput("alt-enter");
+	}
+	await harness.runCommand("queue-drain");
+	assert.deepEqual(harness.sent, [{ content: "one", options: undefined }]);
+
+	harness.setIdle(false);
+	await harness.emit("turn_start");
+	assert.deepEqual(harness.sent, [{ content: "one", options: undefined }]);
+	const rendered = renderWidget(harness);
+	assert.match(rendered, /two/);
+	assert.match(rendered, /three/);
+	assert.match(rendered, /paused/);
+	assert.match(harness.notifications.at(-1)?.message ?? "", /Could not steer drained rows/);
+});
+
+
+test("a drain with an unpreparable row keeps every row queued and pauses", async () => {
+	const harness = createHarness({
+		commands: [{
+			name: "deploy",
+			source: "extension",
+			sourceInfo: { path: "/deploy.ts", source: "test", scope: "temporary", origin: "top-level" },
+		}],
+	});
+	await harness.emit("session_start");
+	await enqueue(harness, "steer", "steer me");
+	await enqueue(harness, "followUp", "/deploy now");
+
+	await harness.runCommand("queue-drain");
+	assert.equal(harness.sent.length, 0);
+	const rendered = renderWidget(harness);
+	assert.match(rendered, /steer me/);
+	assert.match(rendered, /\/deploy now/);
+	assert.match(rendered, /paused/);
+	assert.match(
+		harness.notifications.at(-1)?.message ?? "",
+		/Could not prepare queued messages; queue paused.*cannot be run from the queue/,
+	);
+});
+
+test("a reload carries drained rows that have not reached the first turn", async () => {
+	const first = createHarness();
+	await first.emit("session_start", { reason: "startup" });
+	first.setIdle(true);
+	for (const text of ["one", "two"]) {
+		first.editor.setText(text);
+		first.editor.handleInput("alt-enter");
+	}
+	await first.runCommand("queue-drain");
+	assert.deepEqual(first.sent, [{ content: "one", options: undefined }]);
+	await first.emit("session_shutdown", { reason: "reload" });
+
+	const second = createHarness();
+	second.setIdle(true);
+	await second.emit("session_start", { reason: "reload" });
+	await waitFor(() => second.sent.length === 1);
+	assert.equal(second.sent[0]?.content, "two");
+	await second.emit("session_shutdown", { reason: "quit" });
+});
+

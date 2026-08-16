@@ -11,7 +11,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth, type Component, type EditorComponent } from "@earendil-works/pi-tui";
 import { extractInlineEditorLines } from "./editor-render.ts";
-import { expandQueuedInput, queuesDuringCompaction } from "./queued-input.ts";
+import { expandQueuedInput, isExpandableSlashCommand, queuesDuringCompaction } from "./queued-input.ts";
 import {
 	DeliveryQueue,
 	isQueueableSubmission,
@@ -36,6 +36,7 @@ interface ReloadStash {
 declare global {
 	var __tmustierPiQueueSteerReloadStash: ReloadStash | undefined;
 }
+const DRAIN_COMMAND = "queue-drain";
 const REMOVE_ROW_KEY = "alt+x";
 const TOGGLE_LANE_KEY = "alt+t";
 const REORDER_UP_KEY = "alt+shift+up";
@@ -253,6 +254,12 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 	let baseEditorFactoryCaptured = false;
 	let reloadSubmitTimer: ReturnType<typeof setTimeout> | undefined;
 	let renderingInline = false;
+	/**
+	 * Message rows drained from idle: the head prompt starts the run, these join
+	 * as steering at the first turn. Pairs keep the original row for restores
+	 * and the reload stash.
+	 */
+	let pendingDrain: { original: QueuedMessage<ImageContent>; prepared: QueuedMessage<ImageContent> }[] = [];
 	let paused = false;
 	let settingsManager: SettingsManager | undefined;
 	let blockingActivity: "compact" | "auto-compact" | "reload" | undefined;
@@ -584,6 +591,126 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		return sendHeadMessage(ctx, "followUp", ctx.isIdle() ? undefined : "steer");
 	};
 
+	/**
+	 * Explicit flush of every queued message row in timeline order, delivered as
+	 * steering so both lanes empty into the run at once. Command rows are not
+	 * messages: they stay queued to execute when the agent is idle. From idle,
+	 * the head starts the run through the public prompt path and the remaining
+	 * rows join as steering on the first turn — the earliest moment Pi accepts
+	 * native steering without prompting each row into its own immediate run.
+	 */
+	const drainAll = (ctx: ExtensionContext): void => {
+		activeContext = ctx;
+		if (editSession) {
+			ctx.ui.notify("Finish or cancel row editing before draining the queue", "info");
+			return;
+		}
+		if (blockingActivity) {
+			ctx.ui.notify("The queue drains after the current compaction or reload finishes", "info");
+			return;
+		}
+		const messages = queue.snapshot().filter((item) => !itemCommand(item));
+		if (messages.length === 0) {
+			ctx.ui.notify(
+				queue.length === 0
+					? "Queue is empty"
+					: "No queued messages to drain; command rows still run when the agent is idle",
+				"info",
+			);
+			return;
+		}
+		let pairs: typeof pendingDrain;
+		try {
+			const commands = pi.getCommands();
+			pairs = messages.map((original) => ({
+				original,
+				prepared: { ...original, text: expandQueuedInput(original.text, commands) },
+			}));
+		} catch (error) {
+			paused = true;
+			renderQueue(ctx);
+			ctx.ui.notify(
+				`Could not prepare queued messages; queue paused: ${error instanceof Error ? error.message : String(error)}`,
+				"error",
+			);
+			return;
+		}
+		for (const message of messages) queue.remove(message.id);
+		const keptCommands = queue.length;
+		const commandNote = keptCommands > 0
+			? `; ${keptCommands} command row${keptCommands === 1 ? " stays" : "s stay"} queued`
+			: "";
+		paused = false;
+
+		if (ctx.isIdle()) {
+			const [head, ...rest] = pairs;
+			try {
+				pi.sendUserMessage(userContent(head.prepared));
+			} catch (error) {
+				queue.prependMany(pairs.map((pair) => pair.original));
+				paused = true;
+				renderQueue(ctx);
+				ctx.ui.notify(
+					`Could not drain the queue: ${error instanceof Error ? error.message : String(error)}`,
+					"error",
+				);
+				return;
+			}
+			pendingDrain = rest;
+			renderQueue(ctx);
+			ctx.ui.notify(
+				rest.length === 0
+					? `Sent the queued message to start the run${commandNote}`
+					: `Started the run with the queue head; ${rest.length} more row${rest.length === 1 ? "" : "s"} steer in on the first turn${commandNote}`,
+				"info",
+			);
+			return;
+		}
+
+		let delivered = 0;
+		try {
+			for (const pair of pairs) {
+				pi.sendUserMessage(userContent(pair.prepared), { deliverAs: "steer" });
+				delivered += 1;
+			}
+		} catch (error) {
+			queue.prependMany(pairs.slice(delivered).map((pair) => pair.original));
+			renderQueue(ctx);
+			ctx.ui.notify(
+				`Could not drain the queue: ${error instanceof Error ? error.message : String(error)}; restored the unsent rows`,
+				"error",
+			);
+			return;
+		}
+		renderQueue(ctx);
+		ctx.ui.notify(
+			`Drained ${pairs.length} queued message${pairs.length === 1 ? "" : "s"} as steering${commandNote}`,
+			"info",
+		);
+	};
+
+	/** Deliver idle-drained rows once the head run's first turn accepts native steering. */
+	const flushPendingDrain = (ctx: ExtensionContext): void => {
+		if (pendingDrain.length === 0 || isCompacting()) return;
+		const drained = pendingDrain;
+		pendingDrain = [];
+		let delivered = 0;
+		try {
+			for (const pair of drained) {
+				pi.sendUserMessage(userContent(pair.prepared), { deliverAs: "steer" });
+				delivered += 1;
+			}
+		} catch (error) {
+			queue.prependMany(drained.slice(delivered).map((pair) => pair.original));
+			paused = true;
+			ctx.ui.notify(
+				`Could not steer drained rows: ${error instanceof Error ? error.message : String(error)}; queue paused`,
+				"error",
+			);
+		}
+		renderQueue(ctx);
+	};
+
 	const finishEditing = (
 		ctx: ExtensionContext,
 		save: boolean,
@@ -726,12 +853,13 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 						editor.setText("");
 						return;
 					}
-					if (ctx.isIdle() && isQueueableSubmission(text)) {
-						// While the agent is stopped, Option+Enter parks the message in
+					if (ctx.isIdle() && (isQueueableSubmission(text) || isExpandableSlashCommand(text, pi.getCommands()))) {
+						// While the agent is stopped, Option+Enter parks the submission in
 						// the follow-up lane, paused; plain Enter keeps Pi's immediate
-						// send. Slash commands, templates and bash still act immediately.
-						// Pending paste images are not readable here, matching upstream's
-						// native-capture fidelity.
+						// send. Skill and prompt-template invocations park the same way
+						// and expand when reached; built-ins, extension commands, unknown
+						// slash input and bash still act immediately. Pending paste images
+						// are not readable here, matching upstream's native-capture fidelity.
 						queue.enqueue("followUp", text, []);
 						paused = true;
 						editor.addToHistory?.(text);
@@ -841,6 +969,13 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		}, 0);
 	};
 
+	pi.registerCommand(DRAIN_COMMAND, {
+		description: "Drain every queued message into the run as steering, in timeline order",
+		handler: async (_args, ctx) => {
+			drainAll(ctx);
+		},
+	});
+
 	pi.on("session_start", (event, ctx) => {
 		activeContext = ctx;
 		settingsManager = SettingsManager.create(ctx.cwd, undefined, { projectTrusted: ctx.isProjectTrusted() });
@@ -902,6 +1037,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 	pi.on("turn_start", (_event, ctx) => {
 		activeContext = ctx;
 		if (isCompacting() && nativeCompactionInputQueued) nativeCompactionTurnStarted = true;
+		flushPendingDrain(ctx);
 	});
 
 	pi.on("turn_end", async (event, ctx) => {
@@ -959,8 +1095,9 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", (event) => {
-		if (event.reason === "reload" && queue.length > 0) {
-			const stash: ReloadStash = { paused, rows: queue.snapshot() };
+		const stashRows = [...queue.snapshot(), ...pendingDrain.map((pair) => pair.original)];
+		if (event.reason === "reload" && stashRows.length > 0) {
+			const stash: ReloadStash = { paused, rows: stashRows };
 			globalThis.__tmustierPiQueueSteerReloadStash = stash;
 		} else {
 			globalThis.__tmustierPiQueueSteerReloadStash = undefined;
@@ -988,6 +1125,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		compactionFinishTimer = undefined;
 		editSession = undefined;
 		settingsManager = undefined;
+		pendingDrain = [];
 		paused = false;
 		blockingActivity = undefined;
 		nativeCompactionInputQueued = false;

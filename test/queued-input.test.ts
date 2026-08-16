@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
-import { expandQueuedInput, queuesDuringCompaction } from "../queued-input.ts";
+import { expandQueuedInput, isExpandableSlashCommand, queuesDuringCompaction } from "../queued-input.ts";
 
 function command(name: string, source: SlashCommandInfo["source"], path: string): SlashCommandInfo {
 	return {
@@ -108,6 +108,28 @@ test("classifies only native post-compaction TUI submissions", () => {
 	assert.equal(queuesDuringCompaction("!echo now", [extension, prompt], "followUp"), true);
 	assert.equal(queuesDuringCompaction("/deploy prod", [extension, prompt], "followUp"), false);
 	assert.equal(queuesDuringCompaction("   ", [extension, prompt], "followUp"), false);
+});
+
+test("classifies slash invocations that can park as queue rows", () => {
+	const commands = [
+		command("deploy", "extension", "/extension.ts"),
+		command("review", "prompt", "/review.md"),
+		command("skill:bro", "skill", "/SKILL.md"),
+	];
+	assert.equal(isExpandableSlashCommand("/review now", commands), true);
+	assert.equal(isExpandableSlashCommand("/skill:bro slower", commands), true);
+	assert.equal(isExpandableSlashCommand("/bro slower", commands), true);
+	assert.equal(isExpandableSlashCommand("  /review now  ", commands), true);
+	assert.equal(isExpandableSlashCommand("/deploy prod", commands), false);
+	assert.equal(isExpandableSlashCommand("/model small", commands), false);
+	assert.equal(isExpandableSlashCommand("/compact keep notes", commands), false);
+	assert.equal(isExpandableSlashCommand("/reload", commands), false);
+	assert.equal(isExpandableSlashCommand("/missing", commands), false);
+	assert.equal(isExpandableSlashCommand("ordinary message", commands), false);
+	assert.equal(isExpandableSlashCommand("!echo hi", commands), false);
+	assert.equal(isExpandableSlashCommand("", commands), false);
+	// The /bro shorthand requires the skill:bro listing to exist.
+	assert.equal(isExpandableSlashCommand("/bro slower", [command("review", "prompt", "/review.md")]), false);
 });
 
 test("rejects discovered extension commands", () => {

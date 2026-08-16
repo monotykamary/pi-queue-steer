@@ -61,6 +61,20 @@ function substituteArgs(content: string, args: readonly string[]): string {
 	);
 }
 
+/**
+ * Whether a stopped Option+Enter on this slash invocation can park as a queue
+ * row and expand at delivery: known skill or prompt-template names can;
+ * built-ins, extension commands and unknown slash input keep running
+ * immediately. `/compact` and `/reload` stay command rows, not messages.
+ */
+export function isExpandableSlashCommand(text: string, commands: readonly SlashCommandInfo[]): boolean {
+	const name = /^\/([^\s]+)/.exec(text.trim())?.[1];
+	if (!name || PI_BUILTIN_COMMANDS.has(name)) return false;
+	const command = commands.find((candidate) => candidate.name === name)
+		?? commands.find((candidate) => candidate.source === "skill" && candidate.name === `skill:${name}`);
+	return command !== undefined && command.source !== "extension";
+}
+
 /** Whether Pi's TUI parks this submit in its private post-compaction queue. */
 export function queuesDuringCompaction(
 	text: string,

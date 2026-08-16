@@ -54,7 +54,7 @@ The extension follows your configured Pi action bindings. These are the default 
 | Editing a row | `Escape` | Cancel the session and roll back all unsaved row edits |
 | Empty composer, follow-up queued | `Enter` | Promote the oldest follow-up to steering now |
 | Queue paused after an abort | `Enter` | Resume from the next steering row, or the next follow-up |
-| Agent stopped | `Option+Enter` | Queue the message visibly, paused; `Enter` keeps Pi’s immediate send |
+| Agent stopped | `Option+Enter` | Queue the message (or a skill/template command) visibly, paused; `Enter` keeps Pi's immediate send |
 | Agent working, queue visible | `Escape` | Abort the run and pause both visible lanes |
 
 `Option+Down`, `Option+X`, `Option+T` and `Option+Shift+Up/Down` are the only new fixed shortcuts. The other controls use Pi’s configured action bindings. Terminals outside macOS may label `Option` as `Alt`.
@@ -75,13 +75,13 @@ The extension hands messages back to Pi’s native queues only when their delive
 
 ## Queueing while stopped
 
-With the agent stopped, `Enter` keeps Pi’s normal immediate send. `Option+Enter` instead places the message into the yellow follow-up box, paused. Press `Enter` on the empty composer to send the next queued row, or `Option+Up` to edit it first.
+With the agent stopped, `Enter` keeps Pi's normal immediate send. `Option+Enter` instead places the submission into the yellow follow-up box, paused — including skill and prompt-template invocations such as `/bro simplify this`, which stay short and editable, then autoexpand when the row sends. Press `Enter` on the empty composer to send the next queued row, or `Option+Up` to edit it first.
 
-Pi’s own `/…` commands and prompt templates still run immediately — a stopped `/compact` or `/reload` executes at once (see command rows) — and `!` bash passes straight to the shell.
+Pi's built-ins still run immediately — a stopped `/compact` or `/reload` executes at once (see command rows) — and extension commands, unknown slash input and `!` bash pass straight through.
 
 ## Prompt templates and Agent Skills
 
-Queued `/do-less this code`, `/skill:bro` and `/bro` rows stay short and editable, then expand when delivered. `/bro` is shorthand for `/skill:bro` unless a built-in, prompt or extension already uses that name. Template arguments and images are preserved; unknown slash input remains ordinary text.
+Queued `/do-less this code`, `/skill:bro` and `/bro` rows stay short and editable, then expand when delivered — while the agent works they queue through steering or follow-up input, and while stopped `Option+Enter` parks them paused like any message. `/bro` is shorthand for `/skill:bro` unless a built-in, prompt or extension already uses that name. Template arguments and images are preserved; unknown slash input remains ordinary text.
 
 Pi cannot invoke arbitrary commands through its public extension API. `/compact` and `/reload` are the supported built-ins. A queued extension command pauses delivery until you edit or remove it.
 
@@ -98,6 +98,16 @@ Text-only rows whose text is exactly `/compact`, `/compact <instructions>` or `/
 - ordinary messages submitted during compaction remain in Pi’s native queue and can run before extension-owned command rows after compaction finishes
 - `Option+Enter` on a command while the agent is idle executes it immediately instead of sending the text to the model
 - command rows show a `⚙` marker and pause, resume and edit like any other row; editing a row into or out of command form just works
+
+## Draining the queue
+
+`/queue-drain` empties both lanes into the run at once. Every message row leaves the queue in timeline order — steering rows first, then follow-ups — and is delivered as steering, expanding prompt templates and skills as each row leaves.
+
+- during a run, all drained rows reach Pi's native steering queue immediately, regardless of the `one-at-a-time` and `all` mode settings
+- while stopped, the head starts the run and the remaining rows join as steering on the first turn — the earliest moment native steering is accepted
+- command rows are not messages: `/compact` and `/reload` rows stay queued and still execute once the agent is idle
+- an active row-editing session refuses the drain, so rows are never pulled away mid-draft
+- synchronous hand-off failures restore the unsent rows, in order, to the front of their lanes
 
 ## Editing semantics
 
@@ -129,7 +139,7 @@ Pi’s public `sendUserMessage` API is fire-and-forget. The extension restores s
 
 Pi also exposes queued `/reload` only through the TUI editor’s `void` submit callback. The extension prevents known busy and compaction conflicts and restores trailing rows on a successful runtime swap, but Pi cannot acknowledge or reject that submit back to the extension.
 
-If an `all`-mode lane stays pinned until the agent settles, saving from idle starts the new run with the lane head, then delivers the remaining rows in FIFO order at the next native boundary. The public API has no atomic idle-to-native-queue batch operation, so this restart cannot be one native batch.
+If an `all`-mode lane stays pinned until the agent settles, saving from idle starts the new run with the lane head, then delivers the remaining rows in FIFO order at the next native boundary. The public API has no atomic idle-to-native-queue batch operation, so this restart cannot be one native batch. A drain from idle follows the same rule: the head starts the run and the remaining rows join as native steering at the first turn.
 
 ## Editor composition
 

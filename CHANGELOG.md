@@ -5,7 +5,8 @@
 ### Added
 
 - Reorder the selected row within its lane while editing with `Option+Shift+Up` and `Option+Shift+Down`. Positions keep stable row IDs and attachments, apply to dispatch order immediately and roll back with the rest of the editing session on `Escape`.
-- Queue `Option+Enter` submissions while the agent is stopped: they land in the follow-up lane, paused, and an empty-composer `Enter` sends the next row. Plain `Enter` keeps Pi’s immediate send, and slash commands, prompt templates and `!` bash pass straight through.
+- Queue `Option+Enter` submissions while the agent is stopped: they land in the follow-up lane, paused, and an empty-composer `Enter` sends the next row. Skill and prompt-template invocations such as `/bro simplify this` park the same way and autoexpand when reached. Plain `Enter` keeps Pi's immediate send, and Pi built-ins, extension commands, unknown slash input and `!` bash pass straight through.
+- Add `/queue-drain` to empty both lanes into the run as steering, in timeline order. Command rows stay queued, a drain during row editing is refused, and an idle drain starts the run with the head row and steers the rest at the first turn.
 
 ## 0.2.0 - 2026-08-09
 

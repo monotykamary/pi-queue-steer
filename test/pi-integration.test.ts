@@ -374,3 +374,60 @@ test("real public prompt path triggers overflow compaction and preserves a queue
 		await harness.cleanup();
 	}
 });
+
+test("real registered drain command steers queued rows into the active run in timeline order", async () => {
+	const harness = await createIntegrationHarness();
+	try {
+		await seedSession(harness);
+		// Record each call's new user texts: Pi natively decides how drained
+		// steering rows group into turns, but the flattened order must match the
+		// visible timeline exactly once each.
+		const callTexts: string[] = [];
+		let recordedUsers = 0;
+		const record = (label: string) => (context: any) => {
+			const users = (context.messages as Array<{ role: string; content: unknown }>)
+				.filter((message) => message.role === "user")
+				.map((message) => typeof message.content === "string"
+					? message.content
+					: (message.content as Array<{ type: string; text?: string }>)
+						.filter((part) => part.type === "text")
+						.map((part) => part.text ?? "")
+						.join("\n"));
+			callTexts.push(...users.slice(recordedUsers));
+			recordedUsers = users.length;
+			return fauxAssistantMessage(label);
+		};
+		const active = gatedResponse("active response");
+		harness.faux.setResponses([
+			active.step,
+			record("after drain one"),
+			record("after drain two"),
+			record("after drain three"),
+		]);
+		const activeStarted = nextAgentStart(harness.session);
+		const activePrompt = harness.session.prompt("active prompt");
+		await within(activeStarted, () => "drain-test agent did not start");
+		await harness.session.prompt("steer one", { streamingBehavior: "steer" });
+		await harness.session.prompt("later one", { streamingBehavior: "followUp" });
+		await harness.session.prompt("later two", { streamingBehavior: "followUp" });
+		// Pi executes extension commands immediately, even while streaming.
+		await harness.session.prompt("/queue-drain");
+		const drainedRun = nextAgentRunForUser(harness.session, "later two");
+		active.release();
+		await activePrompt;
+
+		await within(drainedRun, () => "drained rows did not settle");
+		assert.deepEqual(userTexts(harness.session).slice(2), [
+			"active prompt",
+			"steer one",
+			"later one",
+			"later two",
+		]);
+		assert.deepEqual(callTexts.slice(2), ["active prompt", "steer one", "later one", "later two"]);
+		assert.equal(harness.session.getSteeringMessages().length, 0);
+		assert.equal(harness.session.getFollowUpMessages().length, 0);
+	} finally {
+		await harness.cleanup();
+	}
+});
+

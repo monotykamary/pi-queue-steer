@@ -17,6 +17,7 @@
 - Treat row edits as snapshots: save in place; Escape rolls back the entire editing session, including removal marks and lane toggles.
 - Row saves never change delivery lanes implicitly; only the explicit lane toggle re-lanes a row, to the destination tail, on save.
 - Dispatch pauses only when the oldest row has an unsaved edit.
-- `Option+Enter` submissions typed while the agent is stopped queue into the follow-up lane, paused, and send on an explicit empty-composer `Enter`; plain `Enter`, slash commands/templates and `!` bash keep passing straight to Pi.
+- `Option+Enter` submissions typed while the agent is stopped queue into the follow-up lane, paused, and send on an explicit empty-composer `Enter`; skill and prompt-template slash invocations queue the same way and expand when reached, while plain `Enter`, Pi built-ins, extension commands, unknown slash input and `!` bash keep passing straight to Pi.
+- A drain steers every queued message row in timeline order; command rows stay queued, active editing refuses, and an idle drain starts the run with the head and steers the rest at the first turn.
 
 Keep tests close to these invariants and visually verify TUI changes in a real Pi session.
