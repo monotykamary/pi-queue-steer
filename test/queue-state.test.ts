@@ -4,9 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { ImageContent } from "@earendil-works/pi-ai";
-import type { CompactOptions, SlashCommandInfo } from "@earendil-works/pi-coding-agent";
+import { fauxAssistantMessage } from "@earendil-works/pi-ai/compat";
+import { SessionManager, type CompactOptions, type SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import queueSteerExtension from "../index.ts";
+import { isQueueSnapshot, latestQueueSnapshot, queueSnapshotOf, QUEUE_SNAPSHOT_TYPE } from "../queue-persistence.ts";
 import { DeliveryQueue, isQueueableSubmission, QueueEditSession, type QueueLane } from "../queue-state.ts";
 
 test("keeps steering and follow-ups in independent FIFOs", () => {
@@ -243,6 +245,7 @@ function createHarness(options: {
 	sendFailureAt?: number;
 	compactStartError?: Error;
 	autocompleteVisible?: boolean;
+	sessionEntries?: unknown[];
 } = {}) {
 	type Handler = (event: any, context: any) => any;
 	const handlers = new Map<string, Handler[]>();
@@ -251,6 +254,7 @@ function createHarness(options: {
 	const submitted: string[] = [];
 	const compactCalls: CompactOptions[] = [];
 	const notifications: Array<{ message: string; level: string }> = [];
+	const appendedEntries: Array<{ customType: string; data: unknown }> = [];
 	let idle = false;
 	let pending = false;
 	let aborted = false;
@@ -310,6 +314,9 @@ function createHarness(options: {
 			if (options.compactStartError) throw options.compactStartError;
 			compactCalls.push(compactOptions);
 		},
+		sessionManager: {
+			getBranch: (): unknown[] => options.sessionEntries ?? [],
+		},
 	};
 
 	const pi = {
@@ -324,6 +331,9 @@ function createHarness(options: {
 			if (sendOptions) pending = true;
 		},
 		getCommands: () => options.commands ?? [],
+		appendEntry(customType: string, data?: unknown): void {
+			appendedEntries.push({ customType, data });
+		},
 		registerCommand(name: string, commandOptions: { description?: string; handler: (args: string, context: any) => Promise<void> }) {
 			registeredCommands.set(name, commandOptions);
 		},
@@ -348,6 +358,7 @@ function createHarness(options: {
 		submitted,
 		compactCalls,
 		notifications,
+		appendedEntries,
 		async runCommand(name: string, args = "") {
 			const command = registeredCommands.get(name);
 			assert.ok(command, `expected /${name} to be registered`);
@@ -1566,6 +1577,157 @@ test("a send failure during a drain restores every row and pauses", async () => 
 	);
 });
 
+
+test("session shutdown records committed rows as a custom entry and skips reload", async () => {
+	const image: ImageContent = { type: "image", data: "AA==", mimeType: "image/png" };
+	const first = createHarness();
+	await first.emit("session_start", { reason: "startup" });
+	await first.emit("input", {
+		source: "interactive",
+		text: "steer across restart",
+		images: [image],
+		streamingBehavior: "steer",
+	});
+	await enqueue(first, "followUp", "follow-up across restart");
+	await first.emit("session_shutdown", { reason: "quit" });
+
+	assert.equal(first.appendedEntries.length, 1);
+	const recorded = first.appendedEntries[0];
+	assert.ok(recorded, "shutdown should append one snapshot entry");
+	assert.equal(recorded.customType, QUEUE_SNAPSHOT_TYPE);
+	if (!isQueueSnapshot(recorded.data)) assert.fail("recorded payload should be a readable snapshot");
+	assert.deepEqual(
+		recorded.data.rows.map((row) => [row.lane, row.text]),
+		[
+			["steer", "steer across restart"],
+			["followUp", "follow-up across restart"],
+		],
+	);
+	assert.equal(recorded.data.rows[0]?.images[0], image);
+	assert.equal(recorded.data.paused, false);
+
+	// Shutdown is single-shot: the queue is cleared afterwards.
+	await first.emit("session_shutdown", { reason: "quit" });
+	assert.equal(first.appendedEntries.length, 1);
+
+	const second = createHarness();
+	await second.emit("session_start", { reason: "startup" });
+	await enqueue(second, "followUp", "reload-only row");
+	await second.emit("session_shutdown", { reason: "reload" });
+	assert.equal(second.appendedEntries.length, 0);
+});
+
+test("resume restores rows paused until an explicit empty-composer Enter", async () => {
+	const image: ImageContent = { type: "image", data: "AA==", mimeType: "image/png" };
+	const source = new DeliveryQueue<ImageContent>();
+	source.enqueue("steer", "restored steering", [image]);
+	source.enqueue("followUp", "restored follow-up");
+	const entry = {
+		type: "custom",
+		customType: QUEUE_SNAPSHOT_TYPE,
+		data: queueSnapshotOf(source.snapshot(), false),
+	};
+
+	const harness = createHarness({ sessionEntries: [entry] });
+	harness.setIdle(true);
+	await harness.emit("session_start", { reason: "resume" });
+
+	const rendered = renderWidget(harness);
+	assert.match(rendered, /restored steering/);
+	assert.match(rendered, /restored follow-up/);
+	assert.match(rendered, /paused/);
+	assert.match(harness.notifications.at(-1)?.message ?? "", /queue paused/);
+
+	// Paused restoration never ships on its own, even once the agent settles.
+	await harness.emit("agent_settled");
+	assert.equal(harness.sent.length, 0);
+
+	harness.editor.handleInput("enter");
+	await waitFor(() => harness.sent.length === 1);
+	assert.deepEqual(harness.sent[0], {
+		content: [{ type: "text", text: "restored steering" }, image],
+		options: undefined,
+	});
+	assert.doesNotMatch(renderWidget(harness), /restored steering/);
+	assert.match(renderWidget(harness), /restored follow-up/);
+});
+
+test("only startup and resume restores; new, fork and reload runtimes stay pristine", async () => {
+	const rows = new DeliveryQueue<ImageContent>();
+	rows.enqueue("steer", "session row");
+	const entry = {
+		type: "custom",
+		customType: QUEUE_SNAPSHOT_TYPE,
+		data: queueSnapshotOf(rows.snapshot(), true),
+	};
+
+	for (const reason of ["new", "fork", "reload"] as const) {
+		globalThis.__tmustierPiQueueSteerReloadStash = undefined;
+		const harness = createHarness({ sessionEntries: [entry] });
+		await harness.emit("session_start", { reason });
+		assert.equal(harness.widget, undefined, `reason ${reason} should not restore rows`);
+	}
+
+	for (const reason of ["startup", "resume"] as const) {
+		const harness = createHarness({ sessionEntries: [entry] });
+		await harness.emit("session_start", { reason });
+		assert.match(renderWidget(harness), /session row/);
+	}
+
+	const empty = createHarness();
+	await empty.emit("session_start", { reason: "resume" });
+	assert.equal(empty.widget, undefined);
+});
+
+test("restores the newest valid owned snapshot and skips foreign or malformed entries", async () => {
+	const latest = new DeliveryQueue<ImageContent>();
+	latest.enqueue("followUp", "newest row");
+	const older = new DeliveryQueue<ImageContent>();
+	older.enqueue("followUp", "older row");
+	const entries = [
+		{ type: "custom", customType: QUEUE_SNAPSHOT_TYPE, data: queueSnapshotOf(older.snapshot(), false) },
+		{ type: "custom", customType: "other:state", data: { rows: [] } },
+		{ type: "custom", customType: QUEUE_SNAPSHOT_TYPE, data: { version: 99, paused: false, rows: [] } },
+		{ type: "custom", customType: QUEUE_SNAPSHOT_TYPE, data: queueSnapshotOf(latest.snapshot(), true) },
+	];
+
+	const harness = createHarness({ sessionEntries: entries });
+	await harness.emit("session_start", { reason: "startup" });
+	const rendered = renderWidget(harness);
+	assert.match(rendered, /newest row/);
+	assert.doesNotMatch(rendered, /older row/);
+
+	// Restored row counters stay collision-free with later enqueues.
+	await enqueue(harness, "followUp", "fresh row");
+	assert.match(renderWidget(harness), /fresh row/);
+	assert.equal(harness.notifications.some((note) => note.level === "error"), false);
+});
+
+test("a recorded snapshot survives a real session file reopen and stays out of LLM context", () => {
+	const cwd = mkdtempSync(join(tmpdir(), "pi-queue-persist-"));
+	try {
+		const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+		manager.appendMessage({ role: "user", content: "hi", timestamp: Date.now() });
+		manager.appendMessage(fauxAssistantMessage("yo"));
+		const rows = new DeliveryQueue<ImageContent>();
+		const image: ImageContent = { type: "image", data: "B64", mimeType: "image/png" };
+		rows.enqueue("followUp", "survive the restart", [image]);
+		const recorded = queueSnapshotOf(rows.snapshot(), true);
+		manager.appendCustomEntry(QUEUE_SNAPSHOT_TYPE, recorded);
+
+		const file = manager.getSessionFile();
+		assert.ok(file, "expected a persisted session file");
+		const reopened = SessionManager.open(file);
+		const restored = latestQueueSnapshot(reopened.getBranch());
+		assert.ok(restored, "reopened session should expose the queue snapshot");
+		assert.deepEqual(restored.rows, recorded.rows);
+		assert.equal(restored.paused, true);
+		assert.deepEqual(restored.rows[0]?.images[0], image);
+		assert.equal(reopened.buildSessionContext().messages.length, 2);
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
 
 test("a drain with an unpreparable row keeps every row queued and pauses", async () => {
 	const harness = createHarness({

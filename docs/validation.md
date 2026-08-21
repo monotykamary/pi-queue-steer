@@ -99,3 +99,18 @@ This evidence confirms the public API boundary: ordinary input submitted while m
 ## Public API boundary
 
 `ExtensionAPI.sendUserMessage` and the TUI editor submit callback return `void`. The extension can restore synchronous handoff failures and preflight/expansion failures, but it cannot prove every later asynchronous acceptance or rejection without risking duplicate delivery. Queued `/reload` likewise has no result channel. These limits are documented in the README and are not hidden by timing heuristics.
+
+## Resume persistence
+
+The deterministic suite now also covers queue persistence across Pi resume:
+
+- shutdown appends exactly one `pi-queue-steer:queue` custom entry once the queue holds rows, is single-shot, and skips `reload` (which keeps its in-process stash);
+- `session_start` with reason `startup` or `resume` restores the newest valid owned snapshot — paused — and nothing ships until an explicit empty-composer `Enter`; `new`, `fork` and `reload` runtimes stay pristine;
+- foreign custom types, wrong-version payloads and malformed rows are skipped, so an unreadable snapshot can never crash or strand the timeline;
+- restored row counters stay collision-free with later enqueues, and image attachments, lanes and FIFO order round-trip a real `SessionManager` JSONL file while the snapshot stays out of `buildSessionContext`.
+
+Local verification after the change: `npm run ci` passes with 106 automated tests.
+
+### Boundary
+
+Persistence rides Pi's public `pi.appendEntry()` / `getEntries()` contract. Snapshot entries are append-only: each shutdown supersedes the previous snapshot, the restore path trusts only the newest readable one on the active branch, and superseded lines stay in the session JSONL without ever entering the transcript or model context. Two Pi-flush limits bound what resume can promise: sessions without an assistant response are not written to disk at all, and a hard kill skips `session_shutdown`, so only clean exits record the final queue. A real-TUI evidence run for the resume flow should still be recorded before release.

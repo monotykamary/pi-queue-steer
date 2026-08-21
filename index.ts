@@ -12,6 +12,7 @@ import {
 import { matchesKey, truncateToWidth, visibleWidth, type Component, type EditorComponent } from "@earendil-works/pi-tui";
 import { extractInlineEditorLines } from "./editor-render.ts";
 import { expandQueuedInput, isExpandableSlashCommand, queuesDuringCompaction } from "./queued-input.ts";
+import { latestQueueSnapshot, persistQueueSnapshot } from "./queue-persistence.ts";
 import {
 	DeliveryQueue,
 	isQueueableSubmission,
@@ -938,6 +939,7 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		settingsManager = SettingsManager.create(ctx.cwd, undefined, { projectTrusted: ctx.isProjectTrusted() });
 		ctx.ui.setWidget(WIDGET_ID, undefined);
 		restoreReloadStash(event.reason, ctx);
+		restoreSessionQueue(event.reason, ctx);
 		installEditor(ctx);
 		scheduleEditorInstall(ctx);
 		renderQueue(ctx);
@@ -1050,12 +1052,25 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		if (!paused && !editSession && queue.length > 0 && ctx.isIdle() && !blockingActivity) dispatchFromIdle(ctx);
 	});
 
-	pi.on("session_shutdown", (event) => {
+	pi.on("session_shutdown", (event, ctx) => {
 		if (event.reason === "reload" && queue.length > 0) {
 			const stash: ReloadStash = { paused, rows: queue.snapshot() };
 			globalThis.__tmustierPiQueueSteerReloadStash = stash;
 		} else {
 			globalThis.__tmustierPiQueueSteerReloadStash = undefined;
+			// Every other shutdown — quit, /new, /resume, /fork — leaves the
+			// outgoing session with committed rows recorded for a later resume.
+			// Reload is covered by the in-process stash and skips the write.
+			if (queue.length > 0) {
+				try {
+					persistQueueSnapshot(pi, queue.snapshot(), paused);
+				} catch (error) {
+					ctx.ui.notify(
+						`Could not persist queued rows for resume: ${error instanceof Error ? error.message : String(error)}`,
+						"error",
+					);
+				}
+			}
 		}
 		if (editorInstallTimer) clearTimeout(editorInstallTimer);
 		if (reloadSubmitTimer) clearTimeout(reloadSubmitTimer);
@@ -1087,6 +1102,36 @@ export default function queueSteerExtension(pi: ExtensionAPI) {
 		tuiSubmit = undefined;
 		queue.clear();
 	});
+
+	/**
+	 * Re-adopt committed rows from the resumed session file. Only runtime
+	 * starts that genuinely open an existing session restore: cold restarts
+	 * reopen the same session JSONL and an in-process /resume rebinds the
+	 * target session's file. Fresh, forked and reloaded runtimes never
+	 * inherit rows; reload uses the in-process stash instead.
+	 */
+	function restoreSessionQueue(reason: string, ctx: ExtensionContext): void {
+		if (reason !== "startup" && reason !== "resume") return;
+		if (queue.length > 0) return;
+		const snapshot = latestQueueSnapshot(ctx.sessionManager.getBranch());
+		if (!snapshot || snapshot.rows.length === 0) return;
+		try {
+			queue.restore(snapshot.rows);
+		} catch (error) {
+			ctx.ui.notify(
+				`Could not restore queued rows: ${error instanceof Error ? error.message : String(error)}`,
+				"error",
+			);
+			return;
+		}
+		// Restored rows always park in the paused state: nothing ships until
+		// the user presses Enter on the empty composer.
+		paused = true;
+		ctx.ui.notify(
+			`Restored ${snapshot.rows.length} queued row${snapshot.rows.length === 1 ? "" : "s"} after resume; queue paused — ${keyText("tui.input.submit")} sends the next row`,
+			"info",
+		);
+	}
 
 	/** Re-adopt committed queue state after Pi's in-process runtime swap. */
 	function restoreReloadStash(reason: string, ctx: ExtensionContext): void {

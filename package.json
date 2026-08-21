@@ -24,6 +24,7 @@
     "editor-render.ts",
     "queue-state.ts",
     "queued-input.ts",
+    "queue-persistence.ts",
     "README.md",
     "LICENSE",
     "CHANGELOG.md",

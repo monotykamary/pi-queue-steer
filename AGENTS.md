@@ -10,13 +10,14 @@
 ## Invariants
 
 - Use Pi's public extension APIs; do not patch Pi core.
-- Keep queue state and edit drafts session-local and out of the transcript.
+- Keep queued rows and edit drafts out of the transcript; committed rows persist across resume only as invisible custom session entries, and restored rows always come back paused.
 - Preserve FIFO order, stable item IDs, image attachments, and failed-dispatch restoration.
 - Preserve configured Pi keybindings by matching action IDs rather than hard-coded escape sequences.
 - Compose with previously installed custom editors and retain their input behavior.
 - Treat row edits as snapshots: save in place; Escape rolls back the entire editing session, including removal marks and lane toggles.
 - Row saves never change delivery lanes implicitly; only the explicit lane toggle re-lanes a row, to the destination tail, on save.
 - Dispatch pauses only when the oldest row has an unsaved edit.
+- Nothing sends restored rows on its own: a resumed queue waits, paused, for an explicit empty-composer `Enter`.
 - `Option+Enter` submissions typed while the agent is stopped queue into the follow-up lane, paused, and send on an explicit empty-composer `Enter`; skill and prompt-template slash invocations queue the same way and expand when reached, while plain `Enter`, Pi built-ins, extension commands, unknown slash input and `!` bash keep passing straight to Pi.
 - A drain combines every queued message row into one message in timeline order — steered mid-run, started from idle — keeping command rows queued, refusing during active editing, and restoring all rows on a failed send.
 

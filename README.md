@@ -54,6 +54,7 @@ The extension follows your configured Pi action bindings. These are the default 
 | Editing a row | `Escape` | Cancel the session and roll back all unsaved row edits |
 | Empty composer, follow-up queued | `Enter` | Promote the oldest follow-up to steering now |
 | Queue paused after an abort | `Enter` | Resume from the next steering row, or the next follow-up |
+| Queue restored after resume | `Enter` | Send the next queued row; `Option+Up` edits it first |
 | Agent stopped | `Option+Enter` | Queue the message (or a skill/template command) visibly, paused; `Enter` keeps Pi's immediate send |
 | Agent working, queue visible | `Escape` | Abort the run and pause both visible lanes |
 
@@ -132,7 +133,7 @@ Aborting a run pauses both visible lanes. This prevents a follow-up from startin
 
 Press `Enter` on the empty composer to resume; the same keypress sends rows queued while stopped. A synchronous handoff or preflight failure returns the affected batch to the front of its lane.
 
-Queue state, pause state and edit drafts are session-local. They never enter the Pi transcript or persistent session data. A `/reload` runtime swap carries committed rows and pause state through a short in-process handoff; unsaved edit drafts do not cross the swap.
+Committed rows also survive quitting and resuming Pi. On shutdown the extension records the queue in the session file as an invisible custom entry that stays out of the transcript and out of the model context. Reopening that session restores the rows **paused**: nothing sends until you press `Enter` on the empty composer. A `/reload` runtime swap still carries committed rows and pause state through a short in-process handoff. Edit drafts stay session-local and never persist; `/new` starts clean and forks do not inherit rows.
 
 ## Public API limits
 
@@ -141,6 +142,12 @@ Pi’s public `sendUserMessage` API is fire-and-forget. The extension restores s
 Pi also exposes queued `/reload` only through the TUI editor’s `void` submit callback. The extension prevents known busy and compaction conflicts and restores trailing rows on a successful runtime swap, but Pi cannot acknowledge or reject that submit back to the extension.
 
 If an `all`-mode lane stays pinned until the agent settles, saving from idle starts the new run with the lane head, then delivers the remaining rows in FIFO order at the next native boundary. The public API has no atomic idle-to-native-queue batch operation, so this restart cannot be one native batch. Draining sidesteps that limit by composing its combined message client-side, so one send carries every row.
+
+## Resume persistence
+
+Queuing a row does not send it. When Pi shuts down cleanly — `/quit`, Ctrl+C, Ctrl+D, or a session switch — the extension records the committed queue as a custom session entry (`pi-queue-steer:queue`), invisible in the transcript and excluded from the model context. When the same session is reopened (`pi -c`, `pi -r`, `pi --session`, `/resume`), the rows come back in FIFO order with their IDs, lanes, image attachments and command rows intact — and the queue is parked paused. Press `Enter` on the empty composer to send the next row, or `Option+Up` to edit it first.
+
+Rows belong to the session they were queued in. `/new` and `/fork` start with an empty queue. Older snapshots superseded by later ones stay in the session file but are never restored, and a session can only be resumed at all if Pi wrote it: sessions without an assistant response are not persisted by Pi, and a hard kill skips the shutdown hook.
 
 ## Editor composition
 

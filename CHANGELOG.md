@@ -7,6 +7,7 @@
 - Reorder the selected row within its lane while editing with `Option+Shift+Up` and `Option+Shift+Down`. Positions keep stable row IDs and attachments, apply to dispatch order immediately and roll back with the rest of the editing session on `Escape`.
 - Queue `Option+Enter` submissions while the agent is stopped: they land in the follow-up lane, paused, and an empty-composer `Enter` sends the next row. Skill and prompt-template invocations such as `/bro simplify this` park the same way and autoexpand when reached. Plain `Enter` keeps Pi's immediate send, and Pi built-ins, extension commands, unknown slash input and `!` bash pass straight through.
 - Add `/queue-drain` to empty both lanes into the run as one combined message, in timeline order (one steering message mid-run, one prompt from idle). Command rows stay queued, a drain during row editing is refused, image attachments merge in order, and a send failure restores every row and pauses.
+- Record committed queue rows as invisible custom session entries when a session shuts down, and restore them when the same session reopens (`pi -c`, `pi -r`, `pi --session`, `/resume`): FIFO order, IDs, lanes, image attachments and command rows intact, always paused until an explicit empty-composer `Enter` sends the next row. `/reload` keeps its in-process stash, `/new` and forks start clean, and superseded snapshots are ignored.
 
 ## 0.2.0 - 2026-08-09
 
