@@ -1,6 +1,6 @@
 # pi-queue-steer
 
-[![CI](https://github.com/tmustier/pi-queue-steer/actions/workflows/ci.yml/badge.svg)](https://github.com/tmustier/pi-queue-steer/actions/workflows/ci.yml)
+[![CI](https://github.com/monotykamary/pi-queue-steer/actions/workflows/ci.yml/badge.svg)](https://github.com/monotykamary/pi-queue-steer/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A visible steering and follow-up timeline for [Pi](https://github.com/earendil-works/pi-mono).
@@ -18,13 +18,13 @@ Move into any row to edit it. The selected row becomes the live Pi editor, with 
 Install the latest version from GitHub:
 
 ```bash
-pi install git:github.com/tmustier/pi-queue-steer
+pi install git:github.com/monotykamary/pi-queue-steer
 ```
 
 Pin the current release:
 
 ```bash
-pi install git:github.com/tmustier/pi-queue-steer@v0.2.0
+pi install git:github.com/monotykamary/pi-queue-steer@v0.3.0
 ```
 
 Then start a new Pi session or run `/reload`.

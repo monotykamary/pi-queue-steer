@@ -1,6 +1,6 @@
 {
-  "name": "@tmustier/pi-queue-steer",
-  "version": "0.2.0",
+  "name": "@monotykamary/pi-queue-steer",
+  "version": "0.3.0",
   "description": "Visible steering and follow-up queues with inline editing for Pi.",
   "type": "module",
   "license": "MIT",
@@ -15,10 +15,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/tmustier/pi-queue-steer.git"
+    "url": "git+https://github.com/monotykamary/pi-queue-steer.git"
   },
-  "bugs": "https://github.com/tmustier/pi-queue-steer/issues",
-  "homepage": "https://github.com/tmustier/pi-queue-steer",
+  "bugs": "https://github.com/monotykamary/pi-queue-steer/issues",
+  "homepage": "https://github.com/monotykamary/pi-queue-steer",
   "files": [
     "index.ts",
     "editor-render.ts",
